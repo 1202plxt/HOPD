@@ -4,12 +4,53 @@
 
 ## 先配置并激活环境
 
-使用已安装 NVIDIA CUDA 版 PyTorch、支持 Qwen3-VL 的 Transformers（含 `AutoModelForImageTextToText`）、Accelerate、torchvision、NumPy、Pillow、tqdm、qwen-vl-utils 和 decord 的环境。forward 需支持 `logits_to_keep`。环境名按实际情况替换。
+以下步骤用于 Linux + NVIDIA GPU，从零创建 Python 3.11 环境。先确认 `nvidia-smi` 正常，并且驱动支持 CUDA 12.4。这里安装 PyTorch 的 CUDA 12.4 wheel，无需为 SDPA 另外编译 FlashAttention。
 
 ```bash
+# 1. 创建 Python 3.11 环境
+conda create -n qwen3vl python=3.11 -y
 conda activate qwen3vl
+python -m pip install --upgrade pip setuptools wheel
+
+# 2. 安装 NVIDIA CUDA 版 PyTorch 和配套 torchvision
+python -m pip install torch==2.6.0 torchvision==0.21.0 \
+  --index-url https://download.pytorch.org/whl/cu124
+
+# 3. 安装模型、分片加载、视频处理及其他依赖
+python -m pip install \
+  transformers==4.57.1 accelerate safetensors huggingface_hub \
+  "qwen-vl-utils[decord]==0.0.14" decord av \
+  "numpy<2" pillow tqdm einops sentencepiece protobuf psutil
+
+# 4. 清除其他平台的设备可见性设置
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+
+# 5. 检查依赖关系
+python -m pip check
+
+# 6. 检查导入、GPU 数量以及 forward 接口
+python - <<'PY'
+import sys, inspect
+import torch, torchvision, transformers, accelerate
+import numpy, PIL, tqdm, decord, av, qwen_vl_utils
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import Qwen3VLForConditionalGeneration
+
+print('Python:', sys.version)
+print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)
+print('Transformers:', transformers.__version__)
+print('Accelerate:', accelerate.__version__)
+assert torch.cuda.is_available(), 'CUDA unavailable: check NVIDIA driver and PyTorch wheel'
+print('Visible GPUs:', torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    info = torch.cuda.get_device_properties(i)
+    print(i, info.name, f'{info.total_memory / 1024**3:.2f} GiB')
+assert 'logits_to_keep' in inspect.signature(Qwen3VLForConditionalGeneration.forward).parameters
+print('Environment imports and forward interface: OK')
+PY
 ```
+
+上述命令创建环境后，后续进入服务器只需 `conda activate qwen3vl`。训练至少需要两张可见 GPU；依赖检查通过后继续下面的目录和运行步骤。这里列出的是安装配置，尚未在接收者 NVIDIA 机器上完成真实模型训练验证。[Qwen3-VL 官方模型说明](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
 
 ## 放置目录并进入代码目录
 
