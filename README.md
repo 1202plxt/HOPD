@@ -98,7 +98,7 @@ TRAIN_ARGS=(
   --video-dir ../Lkmllm_data/datasets/Train/timelens-100k
   --output-dir "$OUT"
   --teacher-mode gt_clip --gate teacher-better
-  --max-samples 1000 --max-attempts 10000 --epochs 1
+  --max-samples 3000 --max-attempts 10000 --epochs 1
   --student-total-tokens 14336 --student-min-tokens 64
   --teacher-total-tokens 14336 --teacher-min-tokens 64
   --total-tokens 14336 --min-tokens 64 --fps 2 --max-frames 0
