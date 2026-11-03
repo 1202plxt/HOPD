@@ -2,7 +2,16 @@
 
 唯一训练入口是 `scripts/train_qwen3_32b_direct_head_opd.py`，直接读取指定 head。内部依赖中沿用历史名称的文件无需单独运行。无需执行 probe 或 GT-mask。
 
-## 放置目录与激活环境
+## 先配置并激活环境
+
+使用已安装 NVIDIA CUDA 版 PyTorch、支持 Qwen3-VL 的 Transformers（含 `AutoModelForImageTextToText`）、Accelerate、torchvision、NumPy、Pillow、tqdm、qwen-vl-utils 和 decord 的环境。forward 需支持 `logits_to_keep`。环境名按实际情况替换。
+
+```bash
+conda activate qwen3vl
+unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+```
+
+## 放置目录并进入代码目录
 
 将本包的 `Lkmllm_code` 放在项目当前根目录，和 `shared_models`、`Lkmllm_data` 并列：
 
@@ -22,12 +31,8 @@ LK_OPD/
 从项目根目录进入代码目录：
 
 ```bash
-conda activate qwen3vl
 cd Lkmllm_code
-unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 ```
-
-使用已安装 NVIDIA CUDA 版 PyTorch、支持 Qwen3-VL 的 Transformers（含 `AutoModelForImageTextToText`）、Accelerate、torchvision、NumPy、Pillow、tqdm、qwen-vl-utils 和 decord 的环境。forward 需支持 `logits_to_keep`。环境名按实际情况替换。
 
 训练自动识别可见 GPU，至少两卡。教师优先在其余卡分片，先加载教师再加载学生；默认学生及其前后向在逻辑 GPU0。其余卡不足时会尝试使用学生卡预留外的空间。4 卡或 8 卡使用同一命令，可用 `CUDA_VISIBLE_DEVICES` 限定卡数。实际显存峰值需在目标机器验证。
 
