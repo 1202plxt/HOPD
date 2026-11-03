@@ -1,0 +1,45 @@
+{
+  "description": "Previously reported Qwen3-VL-8B GT-mask Top10, zero-based layer/head; source selection at 4096; no runtime probe",
+  "heads": [
+    {
+      "layer": 16,
+      "head": 21
+    },
+    {
+      "layer": 19,
+      "head": 31
+    },
+    {
+      "layer": 18,
+      "head": 19
+    },
+    {
+      "layer": 18,
+      "head": 15
+    },
+    {
+      "layer": 16,
+      "head": 23
+    },
+    {
+      "layer": 20,
+      "head": 23
+    },
+    {
+      "layer": 20,
+      "head": 29
+    },
+    {
+      "layer": 17,
+      "head": 4
+    },
+    {
+      "layer": 22,
+      "head": 4
+    },
+    {
+      "layer": 20,
+      "head": 14
+    }
+  ]
+}
