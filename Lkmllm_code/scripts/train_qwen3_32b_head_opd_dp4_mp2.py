@@ -35,6 +35,46 @@ def sample_identity(sample):
     return (sample['video_path'], sample['query'], sample['gt_start'], sample['gt_end'])
 
 
+def boundary_decision(student, teacher, gt, epsilon):
+    if not student['valid'] or not teacher['valid']:
+        return None, 'invalid_student_or_teacher'
+    s, t = student['prediction'], teacher['prediction']
+    gain = [abs(s[i] - gt[i]) - abs(t[i] - gt[i]) for i in range(2)]
+    result = dict(start_gain=gain[0], end_gain=gain[1],
+                  start=gain[0] > epsilon, end=gain[1] > epsilon)
+    return result, ('boundary_improved' if result['start'] or result['end']
+                    else 'no_boundary_improved')
+
+
+def boundary_token_groups(tokenizer, ids):
+    """Map generated token IDs to two number spans without retokenizing."""
+    import re
+    def decode(tokens):
+        return tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    text = decode(ids)
+    match = re.fullmatch(r'\s*The event happens in\s+(\d+(?:\.\d+)?)\s*-\s*'
+                         r'(\d+(?:\.\d+)?)\s+seconds\.?\s*', text, re.I)
+    if not match:
+        raise ValueError('unsupported_answer_format')
+    offsets, previous = [], 0
+    for i in range(1, len(ids) + 1):
+        prefix = decode(ids[:i])
+        if not text.startswith(prefix) or len(prefix) < previous:
+            raise ValueError('unstable_token_offsets')
+        offsets.append((previous, len(prefix)))
+        previous = len(prefix)
+    groups = []
+    for field in (1, 2):
+        start, end = match.span(field)
+        indices = [i for i, (left, right) in enumerate(offsets) if left < end and right > start]
+        if not indices or offsets[indices[0]][0] > start or offsets[indices[-1]][1] < end:
+            raise ValueError('uncovered_boundary')
+        groups.append(indices)
+    if set(groups[0]) & set(groups[1]):
+        raise ValueError('shared_start_end_token')
+    return groups
+
+
 def candidate_gradient(a, recipe, student, teacher, processors, sample):
     import contextlib
     import torch
@@ -46,9 +86,21 @@ def candidate_gradient(a, recipe, student, teacher, processors, sample):
     y, sg = recipe.generate(student, processors[0], si, sample, duration, a, sampled=True)
     ti = common.move(ti, teacher)
     _, tg = recipe.generate(teacher, processors[1], ti, sample, duration, a)
-    active, reason = base.decide_gate(sg, tg, a)
+    boundary = groups = None
+    if a.boundary_selective:
+        boundary, reason = boundary_decision(sg, tg, [sample['gt_start'], sample['gt_end']], a.boundary_epsilon)
+        active = bool(boundary and (boundary['start'] or boundary['end']))
+        if active:
+            try:
+                groups = boundary_token_groups(processors[0].tokenizer, y[0].tolist())
+            except ValueError as error:
+                active, reason = False, 'timestamp_tokens_' + str(error)
+    else:
+        active, reason = base.decide_gate(sg, tg, a)
     record = dict(sample=sample, accepted=active, gate_reason=reason,
                   student_gate=sg, teacher_gate=tg, student_video=sa, teacher_video=ta)
+    if a.boundary_selective:
+        record.update(boundary=boundary, boundary_token_groups=groups)
     if active:
         with torch.no_grad():
             logits = recipe.select_logits(common.scoring_logits(teacher, ti, recipe.teacher_targets(y)), 'teacher')
@@ -63,7 +115,13 @@ def candidate_gradient(a, recipe, student, teacher, processors, sample):
             log_q = log_q.to(log_p.device)
             if log_p.shape != log_q.shape:
                 raise RuntimeError('Student/teacher vocabulary mismatch')
-            loss = (log_p.exp() * (log_p - log_q)).sum(-1).mean()
+            token_loss = (log_p.exp() * (log_p - log_q)).sum(-1)
+            if a.boundary_selective:
+                indices = (groups[0] if boundary['start'] else []) + (groups[1] if boundary['end'] else [])
+                loss = token_loss[:, indices].mean()
+                record['selected_token_indices'] = indices
+            else:
+                loss = token_loss.mean()
         if not torch.isfinite(loss):
             raise RuntimeError('Nonfinite loss')
         loss.backward()
@@ -94,7 +152,15 @@ def main(entry_override=None):
     original = entry
     if entry_override is not None:
         entry = entry_override
-    a = entry.parser().parse_args()
+    parser = entry.parser()
+    parser.add_argument('--boundary-selective', action='store_true',
+                        help='Distill only timestamp boundaries for which teacher absolute GT error improves')
+    parser.add_argument('--boundary-epsilon', type=float, default=0.,
+                        help='Require strictly greater boundary error improvement in seconds')
+    a = parser.parse_args()
+    import math
+    if not math.isfinite(a.boundary_epsilon) or a.boundary_epsilon < 0:
+        raise ValueError('boundary-epsilon must be finite and nonnegative')
     a._group_data_parallel = True
     if a.student_device != 0:
         raise ValueError('Each two-GPU group requires --student-device 0')
@@ -103,6 +169,11 @@ def main(entry_override=None):
     accepted = processed = steps = pending = 0
     try:
         protocol, samples, _ = entry.prepare(a)
+        if a.boundary_selective:
+            protocol['objective'] = 'Full-vocabulary reverse KL over selected timestamp-number tokens only'
+            protocol['gate'] = dict(mode='boundary_selective', epsilon_seconds=a.boundary_epsilon,
+                decision_rule='both predictions valid; independently select boundaries with teacher absolute GT error smaller by more than epsilon',
+                overall_iou_gate=False, invalid='reject')
         protocol.update(method=('qwen3_32b_direct_heads_dp4_mp2_v1' if entry_override is None else protocol['method']),
             placement='Four disjoint two-GPU model groups; synchronized student adapters',
             distributed=dict(workers=world, gpus_per_worker=2, global_effective_batch=a.grad_accum,
@@ -322,3 +393,4 @@ def main(entry_override=None):
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
