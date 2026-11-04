@@ -1,178 +1,140 @@
-# Qwen3-VL-8B + 32B-GRPO Head-OPD：NVIDIA 自动多卡，14336
+# Qwen3-8B / 冻结32B：边界选择性OPD（保留原文件名）
 
-普通自动模型分片入口是 `scripts/train_qwen3_32b_direct_head_opd.py`；新增八卡分样本入口见下节。两者直接读取指定 head，无需执行 probe 或 GT-mask。
+本包在原 `HeadOPD_Qwen3_32B_NVIDIA_autoGPU` 目录内替换现有Python文件内容，原文件名不变。当前仅训练Qwen3-VL-8B学生，教师为独立、始终冻结的Qwen3-VL-32B；默认学习率2e-5。原自教师、多轮和教师刷新逻辑已移除。
 
-## 八张 NVIDIA GPU：四组分样本，每组两卡
+| 保留的文件名 | 当前作用 |
+|---|---|
+| `train_qwen3_32b_direct_head_opd.py` | 原名训练入口，支持边界选择开关及整段对照 |
+| `train_qwen3_32b_head_opd_dp4_mp2.py` | 分组分样本、梯度同步、保存和导出 |
+| `train_qwen3_boundary_selective_opd.py` | 边界门控、生成数字token映射、选择性KL；直接执行默认启用边界模式 |
+| `probe_qwen32b_privileged_k100.py` | 冻结32B加载、正常视频与GT片段构造；当前不做probe |
+| `train_timelens_three_group_opsd.py` | Head-LoRA与因果位置工具；不训练TimeLens |
+| `qwen_baseline_eval.py` / `qwen_baseline_eval_dp.py` | 单卡/按可见卡分样本普通输入测评 |
+| `merge_self_opsd_round.py` | 导出当前方法的adapter快照；不执行自蒸馏 |
 
-在本包 `Lkmllm_code` 目录、已配置好的原训练Q环境中运行：
+其他历史Python文件名保留；历史训练入口转到同一冻结32B训练逻辑，不再支持rounds等旧参数。不相关实验工具的旧实现已清空，执行时提示使用当前入口。名称只为兼容原目录组织，不代表继续保留旧方法。
 
-```bash
-# 四进程配置预检，不加载模型、不创建训练目录
-bash scripts/run_head_opd_8gpu.sh --plan-only
+## 方法
 
-# 建议先完成小规模真实八卡验证（会导出完整模型）
-OUT="../Lkmllm_data/checkpoints/headopd_dp4_smoke_$(date +%Y%m%d_%H%M%S)" \
-  bash scripts/run_head_opd_8gpu.sh --max-samples 8 --max-attempts 100 --save-every-steps 1
+学生输入全局视频和查询，采样生成一条回答。冻结32B教师输入全局视频、查询及带原视频时间戳的GT参考片段，独立贪心生成回答。教师不接收精确GT答案文本。两路视觉token总数匹配，教师全局画面和参考片段共用视觉预算。
 
-# 正式训练：全局1000个接受样本，250步
-bash scripts/run_head_opd_8gpu.sh
-```
-
-默认GPU分组为 `(0,1)/(2,3)/(4,5)/(6,7)`，可用 `CUDA_VISIBLE_DEVICES` 指定八张卡的顺序。启动器使用单节点四进程 torchrun，每个进程只看到自己的两卡；组内学生放第一卡、教师自动分片到这两卡。每组必须能容纳同预算的学生、教师及激活；不会自动量化或CPU卸载模型权重。
-
-候选事件全局固定打乱且不重复分配。四组共享同一版学生参数，各自执行原采样、GT-clip教师门控及反向KL。每批最多接受 `--grad-accum` 个样本（默认全局4个），缺口补候选，梯度通过Gloo在CPU以float32求和，再除以全局实际接受数。拒绝/空闲组贡献零梯度并参与同步。补样本阶段可能不足四组同时忙碌；不保证四倍速度。每组rollout随机数不同，因此不保证与串行训练逐样本相同。
-
-`max-samples`、`max-attempts`、保存间隔均为全局计数。仅rank0写训练结果及合并权重，所有组结束时校验adapter哈希一致。任一进程异常由torchrun终止其他进程；快照仍为weights-only，不支持完整优化器恢复。预检输出和最终 `training_metadata.json` 记录并行协议、物理卡号和教师分片。正常测评使用原有脚本。
-
-本地完成调度单元检查和Python语法检查，未完成真实PyTorch分布式/GPU验证；本机没有PyTorch/CUDA。服务器小规模验证应确认 `accepted_events=8`、`optimizer_steps=2`、四个adapter哈希一致，以及 `training_complete=true, merged=true`。
-
-## 先配置并激活环境
-
-以下步骤用于 Linux + NVIDIA GPU，从零创建 Python 3.11 环境。先确认 `nvidia-smi` 正常，并且驱动支持 CUDA 12.4。这里安装 PyTorch 的 CUDA 12.4 wheel，无需为 SDPA 另外编译 FlashAttention。
-
-```bash
-# 1. 创建 Python 3.11 环境
-conda create -n qwen3vl python=3.11 -y
-conda activate qwen3vl
-python -m pip install --upgrade pip setuptools wheel
-
-# 2. 安装 NVIDIA CUDA 版 PyTorch 和配套 torchvision
-python -m pip install torch==2.6.0 torchvision==0.21.0 \
-  --index-url https://download.pytorch.org/whl/cu124
-
-# 3. 安装模型、分片加载、视频处理及其他依赖
-python -m pip install \
-  transformers==4.57.1 accelerate safetensors huggingface_hub \
-  "qwen-vl-utils[decord]==0.0.14" decord av \
-  "numpy<2" pillow tqdm einops sentencepiece protobuf psutil
-
-# 4. 清除其他平台的设备可见性设置
-unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
-
-# 5. 检查依赖关系
-python -m pip check
-
-# 6. 检查导入、GPU 数量以及 forward 接口
-python - <<'PY'
-import sys, inspect
-import torch, torchvision, transformers, accelerate
-import numpy, PIL, tqdm, decord, av, qwen_vl_utils
-from transformers import AutoProcessor, AutoModelForImageTextToText
-from transformers import Qwen3VLForConditionalGeneration
-
-print('Python:', sys.version)
-print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)
-print('Transformers:', transformers.__version__)
-print('Accelerate:', accelerate.__version__)
-assert torch.cuda.is_available(), 'CUDA unavailable: check NVIDIA driver and PyTorch wheel'
-print('Visible GPUs:', torch.cuda.device_count())
-for i in range(torch.cuda.device_count()):
-    info = torch.cuda.get_device_properties(i)
-    print(i, info.name, f'{info.total_memory / 1024**3:.2f} GiB')
-assert 'logits_to_keep' in inspect.signature(Qwen3VLForConditionalGeneration.forward).parameters
-print('Environment imports and forward interface: OK')
-PY
-```
-
-上述命令创建环境后，后续进入服务器只需 `conda activate qwen3vl`。训练至少需要两张可见 GPU；依赖检查通过后继续下面的目录和运行步骤。这里列出的是安装配置，尚未在接收者 NVIDIA 机器上完成真实模型训练验证。[Qwen3-VL 官方模型说明](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
-
-## 放置目录并进入代码目录
-
-将本包的 `Lkmllm_code` 放在项目当前根目录，和 `shared_models`、`Lkmllm_data` 并列：
+设GT、学生、教师区间分别为 `[sg, eg]`、`[ss, es]`、`[st, et]`：
 
 ```text
-LK_OPD/
-├── Lkmllm_code/（本包代码、heads、scripts、src）
-├── shared_models/
-│   ├── Qwen3-VL-8B-Instruct/
-│   └── Video-opd-teacher-Qwen3-VL-32B-GRPO/
-└── Lkmllm_data/
-    ├── datasets/Train/timelens-100k/
-    ├── datasets/Test/
-    ├── checkpoints/
-    └── outputs/eval_results/
+start_gain = abs(ss - sg) - abs(st - sg)
+end_gain   = abs(es - eg) - abs(et - eg)
+select_start = start_gain > epsilon
+select_end   = end_gain > epsilon
 ```
 
-从项目根目录进入代码目录：
+`epsilon` 单位为秒，默认0，误差相等不选中。教师预测点落在GT区间内部不等于边界更准。整体IoU只记入日志，**不是边界模式的接受门槛**；教师整体IoU更低时也可能有一个边界值得蒸馏。
+
+| 教师起点更准确 | 教师终点更准确 | 直接损失范围 |
+|---|---|---|
+| 是 | 是 | 两个边界数字token |
+| 是 | 否 | 起点数字token |
+| 否 | 是 | 终点数字token |
+| 否 | 否 | 跳过样本 |
+
+例如GT `[10,20]`、学生 `[9,24]`、教师 `[12,19]`：起点收益−1秒、终点收益3秒，因此仅蒸馏终点。
+
+教师重新评分的是**学生实际生成的同一条token前缀**，不是教师自己生成的答案，也不是GT teacher-forcing。每个选中位置计算全词表 `KL(student || stopgrad(teacher))`，先平均该样本所选数字token，再在全局有效batch内平均样本损失。其余答案token及未选中边界的直接损失为0；参数共享意味着仍可能间接改变另一边界。
+
+当前仅可靠处理 `The event happens in <start> - <end> seconds.` 格式，支持小数和数字跨多个token。通过原始生成token的逐前缀解码映射起止数字，不重新编码规范答案替代实际rollout。预测无效、格式不支持、映射不稳定、同一token跨越两个数字或混入其他非空白答案文字时跳过并记录原因。教师在独立生成中更准，不保证其在学生前缀下的分布一定有益，需独立评测验证。
+
+## 环境与路径
+
+Linux + NVIDIA CUDA + Python 3.11，可使用原qwen3vl环境。新建环境可沿用：
+
+```bash
+conda create -n qwen3vl python=3.11 -y
+conda activate qwen3vl
+python -m pip install torch==2.6.0 torchvision==0.21.0 \
+  --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements.txt
+```
+
+CUDA wheel需兼容实际驱动。将包内 `Lkmllm_code` 与 `shared_models`、`Lkmllm_data` 并列。之后所有运行命令在 `Lkmllm_code` 目录中执行：
 
 ```bash
 cd Lkmllm_code
+conda activate qwen3vl
 ```
 
-训练自动识别可见 GPU，至少两卡。教师优先在其余卡分片，先加载教师再加载学生；默认学生及其前后向在逻辑 GPU0。其余卡不足时会尝试使用学生卡预留外的空间。4 卡或 8 卡使用同一命令，可用 `CUDA_VISIBLE_DEVICES` 限定卡数。实际显存峰值需在目标机器验证。
+模型默认路径为 `../shared_models/Qwen3-VL-8B-Instruct` 和 `../shared_models/Video-opd-teacher-Qwen3-VL-32B-GRPO`。训练标注默认 `../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl`，视频目录为同名数据目录；JSONL记录格式：
 
-## 训练
+```json
+{"video_path":"example.mp4","events":[{"query":"A person opens the door","span":[10.0,20.0]}]}
+```
 
-只提供 14336 训练。学生正常视频上限 14336；教师全局视频与 GT 参考片段共用 14336 上限，其中 GT 片段最多 4096，并附参考片段引导。GT 用于教师片段选取和训练 IoU 门控。实际 token 数写入日志。
+相对video_path以video-dir为基准。预选名单沿用 `heads/qwen3_gtmask_top10.json`，可用 `--heads-json` 指定其他Qwen3名单；不做在线筛选或跨模型迁移。
 
-head 列表在 `heads/qwen3_gtmask_top10.json`，坐标从 0 开始；所附坐标来自此前 Qwen3 的 4096 筛选，在此直接复用。仅训练指定 head 的 Q/O 低秩参数。
-
-学生一次采样回答同时用于 IoU 和 OPD rollout；教师贪心预测，只有教师有效且 IoU 严格超过当前学生才蒸馏，无额外阈值和差值门槛。损失为 rollout 上的全词表反向 KL。梯度累积 4，每 25 步保存 adapter，即每 100 个有效样本保存。目标为 1000 个有效样本、250 步。
-
-以下命令均在 `Lkmllm_code` 目录中执行：
+## 八卡四组运行
 
 ```bash
-OUT="../Lkmllm_data/checkpoints/qwen3_headopd_32b_gtclip_2k_14336_$(date +%Y%m%d_%H%M%S)"
+# CPU逻辑与配置测试
+python -m unittest discover -s scripts -p 'test_*.py' -v
 
-TRAIN_ARGS=(
-  --student-path ../shared_models/Qwen3-VL-8B-Instruct
-  --teacher-path ../shared_models/Video-opd-teacher-Qwen3-VL-32B-GRPO
-  --heads-json heads/qwen3_gtmask_top10.json
-  --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl
-  --video-dir ../Lkmllm_data/datasets/Train/timelens-100k
-  --output-dir "$OUT"
-  --teacher-mode gt_clip --gate teacher-better
-  --max-samples 2000 --max-attempts 10000 --epochs 1
-  --student-total-tokens 14336 --student-min-tokens 64
-  --teacher-total-tokens 14336 --teacher-min-tokens 64
-  --total-tokens 14336 --min-tokens 64 --fps 2 --max-frames 0
-  --pool-factor 2 --max-pool-frames 1536
-  --clip-total-tokens 4096 --clip-fps 4 --clip-max-frames 128
-  --clip-padding-seconds 0
-  --lr 2e-5 --rank 8 --alpha 16 --grad-accum 4
-  --max-new-tokens 80 --max-grad-norm 1
-  --student-device 0 --student-reserve-gib 12 --teacher-reserve-gib 4
-  --offload-saved-tensors --save-every-steps 25 --seed 42
-)
+# 配置预检（不加载模型、不检查显存）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash scripts/run_head_opd_8gpu.sh --plan-only
 
-# 文件和配置预检，不加载模型
-python -u scripts/train_qwen3_32b_direct_head_opd.py "${TRAIN_ARGS[@]}" --plan-only
+# 8个全局有效样本、2次优化的真实冒烟
+OUT="../Lkmllm_data/checkpoints/boundary_smoke_$(date +%Y%m%d_%H%M%S)" \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash scripts/run_head_opd_8gpu.sh \
+  --max-samples 8 --max-attempts 100 --save-every-steps 1
 
 # 正式训练
-python -u scripts/train_qwen3_32b_direct_head_opd.py "${TRAIN_ARGS[@]}"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash scripts/run_head_opd_8gpu.sh
 ```
 
-JSONL 每条样本包含 `video_path` 和 `events`；event 包含 `query` 和秒为单位的 `span: [start, end]`。相对视频路径以 `--video-dir` 为基准。输出目录自动创建。
+默认启用 `--boundary-selective --boundary-epsilon 0`，全局1000个接受样本、有效batch=4、250步，每25步保存adapter。默认14336视觉token/min64/fps2/maxframes0，GT片段最多4096视觉token/fps4/128帧，包含在教师总预算中。仅训练预选head的Q/O LoRA，rank8/alpha16/lr2e-5。
 
-训练结束自动合并权重；检查 `summary.json` 的 `training_complete=true`、`merged=true`。候选耗尽可能未达到有效样本目标，以最终日志为准。`step-*` 是 weights-only 快照，不是完整优化器恢复点。
+每组两卡，学生在组内第一卡，教师自动放置或分片到组内卡，预留学生权重和激活空间。模型权重不卸载到CPU或磁盘；启动脚本默认将学生保存的反向激活放到CPU。实际显存需目标机器验证。不同组处理不同候选，所有组共享同步的学生参数，教师始终冻结。梯度以CPU float32求和除以全局实际接受数，拒绝组贡献零。补有效batch时可能不足四组同时工作，不保证四倍加速。
 
-## 自动多卡测评三个数据集
+可通过 `STUDENT`、`TEACHER`、`ANNO`、`VIDEOS`、`OUT` 环境变量覆盖路径，通过额外参数覆盖 `--lr`、`--max-samples`、`--boundary-epsilon` 等。历史 `run_self_opsd_rounds_8gpu.sh` 文件名也保留并转到当前启动器，但不再支持多轮。
 
-同一终端使用 `MODEL="$OUT"`。另开终端时改为相应的相对路径，例如 `MODEL=../Lkmllm_data/checkpoints/具体训练目录名`。每张可见卡加载完整学生，按样本分片并汇总。三个数据集依次运行。
+## 双卡一组 / 整段对照
 
 ```bash
-MODEL="$OUT"
-EVAL_ROOT="../Lkmllm_data/outputs/eval_results/qwen3_headopd_14336_$(date +%Y%m%d_%H%M%S)"
-TEST_ROOT=../Lkmllm_data/datasets/Test
-
-eval_one () {
-  local split="$1" anno="$2" videos="$3"
-  python -u scripts/qwen_baseline_eval_dp.py \
-    --model-family qwen3vl --model-path "$MODEL" \
-    --anno-json "$anno" --video-dir "$videos" \
-    --output-dir "$EVAL_ROOT/$split" --split "$split" \
-    --fps 2 --min-tokens 4 --total-tokens 14336 --max-frames 1024 \
-    --max-new-tokens 1024 --repetition-penalty 1.0 --max-samples 0 \
-    --attn-implementation sdpa
-}
-
-eval_one Qvhighlights "$TEST_ROOT/Qvhighlights/qvhighlights-timelens.json" "$TEST_ROOT/Qvhighlights/qvhighlights" && \
-eval_one Charades_sta "$TEST_ROOT/Charades_sta/charades-timelens.json" "$TEST_ROOT/Charades_sta/charades" && \
-eval_one Activitynet "$TEST_ROOT/Activitynet/activitynet-timelens.json" "$TEST_ROOT/Activitynet/activitynet"
+CUDA_VISIBLE_DEVICES=0,1 python -u scripts/train_qwen3_32b_direct_head_opd.py \
+  --student-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --teacher-path ../shared_models/Video-opd-teacher-Qwen3-VL-32B-GRPO \
+  --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
+  --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
+  --output-dir "../Lkmllm_data/checkpoints/boundary_2gpu_$(date +%Y%m%d_%H%M%S)" \
+  --gpus-per-worker 2 --boundary-selective --boundary-epsilon 0 \
+  --lr 2e-5 --max-samples 1000 --max-attempts 10000 --grad-accum 4 \
+  --offload-saved-tensors
 ```
 
-测评保持此前 Qwen3 协议：14336 上限、min4、最多 1024 帧；训练为 min64。学生测评只接收正常视频和查询。结果保存于 `$EVAL_ROOT/<split>/metrics_<split>.json`，报告 mIoU、R@0.3/0.5/0.7。测原始学生时，将 `MODEL` 改为 `../shared_models/Qwen3-VL-8B-Instruct`。
+先冒烟时再加 `--max-samples 8 --max-attempts 100 --save-every-steps 1`。不传 `--boundary-selective` 时沿用整体IoU严格teacher-better门控、整段学生回答KL的基线。原单卡自教师启动器保留文件名但停止执行并给出提示；当前8B+32B方案至少需要两卡，不承诺单卡显存适配。
 
-## 检查范围
+## 导出与QV测评
 
-原入口完成 Python 静态语法和入口参数检查，新增分样本入口完成静态语法和CPU调度测试；未在 NVIDIA GPU 上运行真实训练与测评。文件校验值在 `MANIFEST.sha256`。
+达到接受目标后自动导出完整学生到输出根目录。中间adapter也可单独合并，名称沿用原文件：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/merge_self_opsd_round.py \
+  --snapshot /data/checkpoints/boundary_run/step-000025 \
+  --output-dir /data/checkpoints/boundary_step25_merged
+
+CUDA_VISIBLE_DEVICES=0 python -u scripts/qwen_baseline_eval.py \
+  --model-family qwen3vl --model-path /data/checkpoints/boundary_run \
+  --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
+  --output-dir ../Lkmllm_data/outputs/boundary_qv_run \
+  --split Qvhighlights --fps 2 --min-tokens 4 \
+  --total-tokens 14336 --max-frames 1024 --max-new-tokens 1024
+```
+
+多卡测评时将文件改为 `scripts/qwen_baseline_eval_dp.py` 并设置多张可见卡，每张卡加载完整学生并分样本，汇总保留全部样本分母。学生测评只输入普通视频与查询，GT仅用于生成后的指标；贪心、repetition_penalty=1.0、SDPA，缺视频/解码/解析/OOM等失败计零。结果含mIoU和R@0.3/0.5/0.7；训练min64与测评min4的差异需报告。
+
+## 日志与验证范围
+
+train.jsonl记录师生预测、IoU、各边界误差/收益、选择结果、数字token索引及跳过原因。training_metadata.json记录模型config/index摘要和shard大小、head/标注/源码摘要及GPU布局；未计算完整基座权重摘要。summary.json记录全局接受/候选数、步数及单边界/双边界接受计数。快照为weights-only，不支持完整优化器/RNG恢复。输出必须是新目录。
+
+本地14项CPU测试通过；3项真实PyTorch梯度/因果位置/候选反向测试因无PyTorch而跳过。语法与原名入口help通过。真实tokenizer、GPU前后向、分布式通信、显存、导出和下游指标仍需服务器验证，不声明已有性能提升。先冒烟再比较原模型、整段蒸馏与边界蒸馏；固定基础权重、head、预算、学习率和测评协议，并报告两种门控接受的事件可能不同。
+
+上传GitHub时上传本文件夹内容即可；不上传模型、数据或运行产物。文件校验在MANIFEST.sha256。
