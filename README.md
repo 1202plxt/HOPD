@@ -112,7 +112,7 @@ head 列表在 `heads/qwen3_gtmask_top10.json`，坐标从 0 开始；所附坐�
 以下命令均在 `Lkmllm_code` 目录中执行：
 
 ```bash
-OUT="../Lkmllm_data/checkpoints/qwen3_headopd_32b_gtclip_1k_14336_$(date +%Y%m%d_%H%M%S)"
+OUT="../Lkmllm_data/checkpoints/qwen3_headopd_32b_gtclip_2k_14336_$(date +%Y%m%d_%H%M%S)"
 
 TRAIN_ARGS=(
   --student-path ../shared_models/Qwen3-VL-8B-Instruct
@@ -122,7 +122,7 @@ TRAIN_ARGS=(
   --video-dir ../Lkmllm_data/datasets/Train/timelens-100k
   --output-dir "$OUT"
   --teacher-mode gt_clip --gate teacher-better
-  --max-samples 1000 --max-attempts 10000 --epochs 1
+  --max-samples 2000 --max-attempts 10000 --epochs 1
   --student-total-tokens 14336 --student-min-tokens 64
   --teacher-total-tokens 14336 --teacher-min-tokens 64
   --total-tokens 14336 --min-tokens 64 --fps 2 --max-frames 0
