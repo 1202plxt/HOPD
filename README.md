@@ -1,6 +1,30 @@
 # Qwen3-VL-8B + 32B-GRPO Head-OPD：NVIDIA 自动多卡，14336
 
-唯一训练入口是 `scripts/train_qwen3_32b_direct_head_opd.py`，直接读取指定 head。内部依赖中沿用历史名称的文件无需单独运行。无需执行 probe 或 GT-mask。
+普通自动模型分片入口是 `scripts/train_qwen3_32b_direct_head_opd.py`；新增八卡分样本入口见下节。两者直接读取指定 head，无需执行 probe 或 GT-mask。
+
+## 八张 NVIDIA GPU：四组分样本，每组两卡
+
+在本包 `Lkmllm_code` 目录、已配置好的原训练Q环境中运行：
+
+```bash
+# 四进程配置预检，不加载模型、不创建训练目录
+bash scripts/run_head_opd_8gpu.sh --plan-only
+
+# 建议先完成小规模真实八卡验证（会导出完整模型）
+OUT="../Lkmllm_data/checkpoints/headopd_dp4_smoke_$(date +%Y%m%d_%H%M%S)" \
+  bash scripts/run_head_opd_8gpu.sh --max-samples 8 --max-attempts 100 --save-every-steps 1
+
+# 正式训练：全局1000个接受样本，250步
+bash scripts/run_head_opd_8gpu.sh
+```
+
+默认GPU分组为 `(0,1)/(2,3)/(4,5)/(6,7)`，可用 `CUDA_VISIBLE_DEVICES` 指定八张卡的顺序。启动器使用单节点四进程 torchrun，每个进程只看到自己的两卡；组内学生放第一卡、教师自动分片到这两卡。每组必须能容纳同预算的学生、教师及激活；不会自动量化或CPU卸载模型权重。
+
+候选事件全局固定打乱且不重复分配。四组共享同一版学生参数，各自执行原采样、GT-clip教师门控及反向KL。每批最多接受 `--grad-accum` 个样本（默认全局4个），缺口补候选，梯度通过Gloo在CPU以float32求和，再除以全局实际接受数。拒绝/空闲组贡献零梯度并参与同步。补样本阶段可能不足四组同时忙碌；不保证四倍速度。每组rollout随机数不同，因此不保证与串行训练逐样本相同。
+
+`max-samples`、`max-attempts`、保存间隔均为全局计数。仅rank0写训练结果及合并权重，所有组结束时校验adapter哈希一致。任一进程异常由torchrun终止其他进程；快照仍为weights-only，不支持完整优化器恢复。预检输出和最终 `training_metadata.json` 记录并行协议、物理卡号和教师分片。正常测评使用原有脚本。
+
+本地完成调度单元检查和Python语法检查，未完成真实PyTorch分布式/GPU验证；本机没有PyTorch/CUDA。服务器小规模验证应确认 `accepted_events=8`、`optimizer_steps=2`、四个adapter哈希一致，以及 `training_complete=true, merged=true`。
 
 ## 先配置并激活环境
 
@@ -98,7 +122,7 @@ TRAIN_ARGS=(
   --video-dir ../Lkmllm_data/datasets/Train/timelens-100k
   --output-dir "$OUT"
   --teacher-mode gt_clip --gate teacher-better
-  --max-samples 3000 --max-attempts 10000 --epochs 1
+  --max-samples 1000 --max-attempts 10000 --epochs 1
   --student-total-tokens 14336 --student-min-tokens 64
   --teacher-total-tokens 14336 --teacher-min-tokens 64
   --total-tokens 14336 --min-tokens 64 --fps 2 --max-frames 0
@@ -151,4 +175,4 @@ eval_one Activitynet "$TEST_ROOT/Activitynet/activitynet-timelens.json" "$TEST_R
 
 ## 检查范围
 
-本次交付完成 Python 静态语法和入口参数检查，未在 NVIDIA GPU 上运行真实训练与测评。无测试脚本。文件校验值在 `MANIFEST.sha256`。
+原入口完成 Python 静态语法和入口参数检查，新增分样本入口完成静态语法和CPU调度测试；未在 NVIDIA GPU 上运行真实训练与测评。文件校验值在 `MANIFEST.sha256`。
