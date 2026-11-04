@@ -275,7 +275,7 @@ def checkpoint_identity(path, expected_family='qwen3_vl'):
 
 
 def validate_common(a, sample_limit=None):
-    if int(os.environ.get('WORLD_SIZE', '1')) != 1:
+    if int(os.environ.get('WORLD_SIZE', '1')) != 1 and not getattr(a, '_group_data_parallel', False):
         raise ValueError('One process only; do not use torchrun')
     if 'train' not in {s.lower() for s in Path(a.anno_json).parts}:
         raise ValueError('Privilege probing and selection require annotations under Train')
@@ -295,12 +295,15 @@ def validate_common(a, sample_limit=None):
         raise FileExistsError('Use a new empty output directory; no implicit resume')
     teacher = checkpoint_identity(a.teacher_path)
     student = checkpoint_identity(a.student_path, getattr(a, '_student_family', 'qwen3_vl'))
-    if Path(a.teacher_path).resolve() == Path(a.student_path).resolve():
+    self_teacher = getattr(a, '_round_self_teacher', False)
+    if self_teacher and Path(a.teacher_path).resolve() != Path(a.student_path).resolve():
+        raise ValueError('Round self-teacher must start from the exact student checkpoint')
+    if not self_teacher and Path(a.teacher_path).resolve() == Path(a.student_path).resolve():
         raise ValueError('Independent 32B teacher and 8B student required')
     # Validate actual local shapes rather than infer checkpoint identity from its name.
     tc = teacher['config'].get('text_config', teacher['config'])
     sc = student['config'].get('text_config', student['config'])
-    if tc['hidden_size'] <= sc['hidden_size'] or tc['num_hidden_layers'] < sc['num_hidden_layers']:
+    if not self_teacher and (tc['hidden_size'] <= sc['hidden_size'] or tc['num_hidden_layers'] < sc['num_hidden_layers']):
         raise ValueError('Teacher config is not larger than the student; inspect actual downloaded weights')
     import train_timelens_three_group_opsd as core
     limit = a.max_samples if sample_limit is None else sample_limit
@@ -645,6 +648,8 @@ def build_gt_clip_input(processor, sample, pool, mode, a):
     content.insert(0, dict(type='text',text='Full-source context video:'))
     content.insert(2, dict(type='text',text=GT_CLIP_GUIDANCE+'\nReference clip:'))
     content.insert(3, dict(type='video',video=sample['video_path']))
+    if getattr(a, '_gt_reference_text', False):
+        content[-1]['text'] += reference_interval_text(sample)
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = dict(processor(text=[text], videos=[global_tensor,clip_tensor],
         video_metadata=[copy.deepcopy(global_meta),copy.deepcopy(clip_meta)], return_tensors='pt', padding=True,
@@ -672,6 +677,12 @@ def build_gt_clip_input(processor, sample, pool, mode, a):
                   metadata_audit=meta_audit),
         shortcut_note='Exact GT crop selection plus original timestamps reveals target location; content benefit needs blank/control comparison')
     return inputs, audit
+
+
+def reference_interval_text(sample):
+    return (f"\nThe reference temporal interval is {sample['gt_start']:g} - "
+            f"{sample['gt_end']:g} seconds in the original source video. "
+            "Analyze the video evidence and give your own temporal prediction.")
 
 
 def build_input(processor, sample, pool, mode, a):
