@@ -8,6 +8,8 @@ import math
 import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 import time
 
 import train_timelens_three_group_opsd as modeling
@@ -38,7 +40,37 @@ def parser():
     p.add_argument('--offload-saved-tensors', action='store_true')
     p.add_argument('--skip-merge', action='store_true')
     p.add_argument('--plan-only', action='store_true')
+    p.add_argument('--auto-launch', action='store_true',
+                   help='Detect visible CUDA GPUs and launch one synchronized sample worker per GPU group')
     return p
+
+
+def automatic_topology(devices, size=2):
+    if size < 2 or not devices or len(set(devices)) != len(devices) or not all(devices):
+        raise ValueError('Require distinct visible GPU IDs and at least two GPUs per group')
+    workers = len(devices)//size
+    if not workers:
+        raise ValueError(f'This 8B student + 32B teacher recipe requires at least {size} visible GPUs')
+    used = devices[:workers*size]
+    return workers, used, devices[workers*size:]
+
+
+def launch_auto(a, values):
+    import torch
+    if torch.version.cuda is None or torch.version.hip is not None or not torch.cuda.is_available():
+        raise RuntimeError('Require NVIDIA CUDA PyTorch and available NVIDIA GPUs')
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    count = torch.cuda.device_count()
+    devices = [d.strip() for d in visible.split(',')] if visible is not None else list(map(str,range(count)))
+    if len(devices) != count:
+        raise ValueError('CUDA_VISIBLE_DEVICES differs from the CUDA-visible device count')
+    workers, used, idle = automatic_topology(devices, a.gpus_per_worker)
+    print(f'[auto] visible GPUs={count}; groups={workers}; GPUs/group={a.gpus_per_worker}; '
+          f'groups={[used[i:i+a.gpus_per_worker] for i in range(0,len(used),a.gpus_per_worker)]}; unused={idle}', flush=True)
+    child_args = [v for v in values if v != '--auto-launch']
+    command = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
+               f'--nproc_per_node={workers}', str(Path(__file__).resolve()), *child_args]
+    return subprocess.run(command, env=dict(os.environ,CUDA_VISIBLE_DEVICES=','.join(used)), check=False).returncode
 
 
 def group_devices(visible, rank, world, size):
@@ -114,9 +146,12 @@ def prepare(a):
         objective=('Mean full-vocabulary KL(student || stopgrad teacher) over selected numeric tokens per example; average examples in effective batch'
             if a.boundary_selective else 'Mean full-vocabulary KL over the entire student continuation; average examples in effective batch'),
         active_gate='Independent boundary absolute errors, no IoU gate' if a.boundary_selective else 'Teacher valid and teacher IoU > student IoU',
-        baseline='Without --boundary-selective: valid teacher IoU strictly greater than sampled student IoU (invalid student IoU=0); full continuation KL',
+        baseline='Without --boundary-selective: valid teacher greedy IoU strictly greater than greedy student IoU (invalid student IoU=0); full continuation KL',
         teacher_policy='Independent pretrained 32B, permanently frozen; full-source context plus original-timeline GT clip; no GT answer text',
-        student_policy='Normal full-source video/query; sampled continuation reused for gate and scoring',
+        student_policy='Normal full-source video/query; current student greedy continuation reused for gate and scoring',
+        rollout_generation=dict(student_do_sample=False, teacher_do_sample=False, num_beams=1,
+            temperature=None, top_p=None, top_k=None, repetition_penalty=1.,
+            max_new_tokens=a.max_new_tokens, policy_version='greedy_v1_20261105'),
         visual_budget='Global source context and reference clip share the total cap; normal student has equal actual visual-token count',
         source_sha256={str(p.relative_to(ROOT)): video.sha(p) for p in sorted(ROOT.rglob('*.py'))},
         resume='Weights-only snapshots; no optimizer/RNG resume'), samples
@@ -125,7 +160,7 @@ def prepare(a):
 def candidate_gradient(a, student, teacher, processors, sample):
     import torch
     si, ti, sa, ta, duration = video.training_inputs(processors, sample, a)
-    y, sg = video.generate(student, processors[0], si, sample, duration, a, sampled=True)
+    y, sg = video.generate(student, processors[0], si, sample, duration, a, sampled=False)
     _, tg = video.generate(teacher, processors[1], ti, sample, duration, a, sampled=False)
     decision = groups = None
     indices = []
@@ -165,7 +200,10 @@ def candidate_gradient(a, student, teacher, processors, sample):
 
 
 def main(argv=None):
-    a = parser().parse_args(argv)
+    values = sys.argv[1:] if argv is None else list(argv)
+    a = parser().parse_args(values)
+    if a.auto_launch and 'LOCAL_RANK' not in os.environ:
+        return launch_auto(a, values)
     rank, local = int(os.environ.get('RANK', '0')), int(os.environ.get('LOCAL_RANK', '0'))
     world = int(os.environ.get('WORLD_SIZE', '1'))
     if rank != local:

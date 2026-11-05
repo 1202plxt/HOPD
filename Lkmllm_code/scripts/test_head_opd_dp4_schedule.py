@@ -9,10 +9,79 @@ import unittest
 from unittest.mock import patch
 
 import train_timelens_three_group_opsd as modeling
-from train_qwen3_32b_head_opd_dp4_mp2 import parser, prepare, group_devices, wave_size, main
+from train_qwen3_32b_head_opd_dp4_mp2 import parser, prepare, group_devices, wave_size, main, automatic_topology, launch_auto
 
 
 class TrainingTests(unittest.TestCase):
+    def test_student_and_teacher_gate_both_use_greedy_generation(self):
+        import sys
+        from types import SimpleNamespace
+        import train_qwen3_32b_head_opd_dp4_mp2 as training
+        student, teacher, y = object(), object(), object()
+        a = SimpleNamespace(boundary_selective=False)
+        sg, tg = dict(valid=True, iou=.8), dict(valid=False, iou=0.)
+        with patch.dict(sys.modules, {'torch': SimpleNamespace()}), \
+             patch.object(training.video, 'training_inputs', return_value=({}, {}, {}, {}, 100.)), \
+             patch.object(training.video, 'generate', side_effect=[(y, sg), (None, tg)]) as generate:
+            row = training.candidate_gradient(a, student, teacher, [None, None], {})
+        self.assertFalse(row['accepted'])
+        self.assertEqual([call.args[0] for call in generate.call_args_list], [student, teacher])
+        self.assertEqual([call.kwargs['sampled'] for call in generate.call_args_list], [False, False])
+
+    def test_greedy_generator_clears_inherited_sampling_options(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import probe_qwen32b_privileged_k100 as video
+        class Tokens:
+            shape = (1, 2)
+            def detach(self): return self
+            def cpu(self): return self
+            def clone(self): return self
+            def numel(self): return 2
+            def __getitem__(self, key): return self
+            def tolist(self): return [7, 9]
+        tokens = Tokens()
+        model = SimpleNamespace(eval=Mock(), config=SimpleNamespace(max_position_embeddings=1000),
+            generation_config=SimpleNamespace(eos_token_id=9), generate=Mock(return_value=tokens))
+        processor = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=0, decode=lambda *a, **k:'answer'))
+        a = SimpleNamespace(max_new_tokens=80)
+        with patch.dict(sys.modules, {'torch': SimpleNamespace(no_grad=contextlib.nullcontext)}), \
+             patch.object(video, 'move', side_effect=lambda inputs, model:inputs), \
+             patch.object(modeling, 'reset_rope'), \
+             patch.object(video, 'parse_prediction', return_value=dict(valid=True)):
+            video.generate(model, processor, dict(input_ids=tokens), dict(gt_start=1.,gt_end=2.), 100., a)
+        kwargs = model.generate.call_args.kwargs
+        self.assertFalse(kwargs['do_sample'])
+        self.assertEqual(kwargs['num_beams'], 1)
+        for key in ('temperature', 'top_p', 'top_k'):
+            self.assertIsNone(kwargs[key])
+
+    def test_automatic_pair_counts_and_odd_gpu(self):
+        for count in (2,4,6,8):
+            devices = list(map(str,range(count)))
+            self.assertEqual(automatic_topology(devices), (count//2,devices,[]))
+        self.assertEqual(automatic_topology(['7','3','1']), (1,['7','3'],['1']))
+        with self.assertRaises(ValueError):
+            automatic_topology(['0'])
+
+    def test_auto_launch_uses_current_interpreter_and_selected_gpu_labels(self):
+        import sys
+        from types import SimpleNamespace
+        fake = SimpleNamespace(version=SimpleNamespace(cuda='12.4',hip=None),
+            cuda=SimpleNamespace(is_available=lambda:True,device_count=lambda:5))
+        a = SimpleNamespace(gpus_per_worker=2)
+        with patch.dict(sys.modules, {'torch':fake}), \
+             patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES':'7,3,5,1,6'}), \
+             patch('train_qwen3_32b_head_opd_dp4_mp2.subprocess.run',return_value=SimpleNamespace(returncode=0)) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(launch_auto(a,['--auto-launch','--boundary-selective']),0)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3],[sys.executable,'-m','torch.distributed.run'])
+        self.assertIn('--nproc_per_node=2',command)
+        self.assertNotIn('--auto-launch',command)
+        self.assertEqual(run.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'],'7,3,5,1')
+
     def test_gpu_groups_are_disjoint(self):
         self.assertEqual([group_devices('7,3,5,1,6,2,4,0', r, 4, 2) for r in range(4)],
                          ['7,3', '5,1', '6,2', '4,0'])
@@ -22,7 +91,7 @@ class TrainingTests(unittest.TestCase):
                 group_devices(visible, 0, 1, 2)
 
     def test_global_batches_rejections_and_tail(self):
-        for workers in (1, 4):
+        for workers in (1, 2, 3, 4):
             for target in (1, 9, 1000):
                 for rate in (0., .2, 1.):
                     rng = random.Random(42)
@@ -71,6 +140,8 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(a.lr, 2e-5)
             self.assertEqual(len(samples), 8)
             self.assertEqual(protocol['method'], 'boundary_selective_opd')
+            self.assertFalse(protocol['rollout_generation']['student_do_sample'])
+            self.assertFalse(protocol['rollout_generation']['teacher_do_sample'])
             self.assertFalse(protocol['boundary_policy']['overall_iou_gate'])
             self.assertFalse((root/'out').exists())
             output = io.StringIO()

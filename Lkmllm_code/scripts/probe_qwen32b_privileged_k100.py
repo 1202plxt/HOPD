@@ -372,7 +372,8 @@ def generate(model, processor, inputs, sample, duration, a, sampled=False, gener
             max_new_tokens=a.max_new_tokens, use_cache=True, repetition_penalty=1.,
             logits_to_keep=1, output_attentions=False, output_hidden_states=False,
             pad_token_id=processor.tokenizer.pad_token_id,
-            **(dict(temperature=1., top_p=1., top_k=0) if sampled else {}),
+            **(dict(temperature=1., top_p=1., top_k=0) if sampled else
+               dict(temperature=None, top_p=None, top_k=None)),
             **(generation_options or {}))
     y = output[:, inputs['input_ids'].shape[1]:].detach().cpu().clone()
     del output
