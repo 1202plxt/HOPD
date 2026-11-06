@@ -99,8 +99,8 @@ def load_runtime(a):
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
     from accelerate import init_empty_weights, infer_auto_device_map
-    if torch.version.cuda is None or torch.version.hip is not None or torch.cuda.device_count() < 2:
-        raise RuntimeError('Requires NVIDIA CUDA PyTorch and at least two visible NVIDIA GPUs')
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        raise RuntimeError('Requires CUDA or HIP PyTorch and at least two visible GPUs')
     torch.manual_seed(a.seed)
     processors = [AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=True,
                        padding_side='left', do_resize=False) for path in
@@ -323,6 +323,8 @@ def build_gt_clip_input(processor, sample, pool, mode, a):
     content.insert(0, dict(type='text',text='Full-source context video:'))
     content.insert(2, dict(type='text',text=GT_CLIP_GUIDANCE+'\nReference clip:'))
     content.insert(3, dict(type='video',video=sample['video_path']))
+    if getattr(a,'token_local_gate',False):
+        content[-1]['text'] += (f"\nThe reference temporal interval is {sample['gt_start']} to {sample['gt_end']} seconds. Analyze the video evidence and give your own prediction.")
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = dict(processor(text=[text], videos=[global_tensor,clip_tensor],
         video_metadata=[copy.deepcopy(global_meta),copy.deepcopy(clip_meta)], return_tensors='pt', padding=True,
@@ -338,7 +340,7 @@ def build_gt_clip_input(processor, sample, pool, mode, a):
     audit = dict(mode=mode, actual_visual_tokens=actual, target_tokens=a.total_tokens,
         global_visual_tokens=global_keep*per, clip_visual_tokens=len(clip_groups)*per,
         full_view_reallocated=True, total_budget_policy='global+clip exactly matches normal total visual tokens',
-        duration=pool['duration'], guidance_applied=True, user_prompt=content[2]['text']+'\n'+content[-1]['text'],
+        duration=pool['duration'], gt_answer_text=bool(getattr(a,'token_local_gate',False)), guidance_applied=True, user_prompt=content[2]['text']+'\n'+content[-1]['text'],
         focus_regions=[], original_chat_messages=messages, global_source_frame_indices=global_meta['frames_indices'],
         clip=dict(requested_interval=[start,end], gt_interval=[sample['gt_start'],sample['gt_end']],
                   padding_seconds=a.clip_padding_seconds, requested_fps=a.clip_fps,
@@ -507,3 +509,4 @@ def normal_input(processor, sample, total_tokens, min_tokens, fps, max_frames=0)
         user_prompt=messages[-1]['content'][-1]['text'], guidance_applied=False,
         processing='native branch-specific resize; cap whole groups uniformly; preserve original timestamps')
     return inputs, audit
+

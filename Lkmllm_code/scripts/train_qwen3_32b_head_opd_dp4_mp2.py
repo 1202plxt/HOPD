@@ -24,10 +24,11 @@ def parser():
     for name in ('student-path', 'teacher-path', 'anno-json', 'video-dir', 'output-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--heads-json', default=str(ROOT/'heads/qwen3_gtmask_top10.json'))
+    p.add_argument('--token-local-gate', action='store_true', help='One teacher scoring pass; Top1 substitution gate; full-vocabulary KL on ordinary and improving timestamp positions')
     p.add_argument('--boundary-selective', action='store_true',
                    help='Independent boundary-error gate and selected-number-token KL; otherwise whole-answer IoU-gated baseline')
     p.add_argument('--boundary-epsilon', type=float, default=0., help='Strict improvement margin in seconds')
-    for name, default in (('gpus-per-worker', 2), ('max-samples', 1000), ('max-attempts', 10000),
+    for name, default in (('gpus-per-worker', 2), ('max-samples', 2000), ('max-attempts', 10000),
                           ('grad-accum', 4), ('rank', 8), ('total-tokens', 14336), ('min-tokens', 64),
                           ('max-frames', 0), ('pool-factor', 2), ('max-pool-frames', 1536),
                           ('clip-total-tokens', 4096), ('clip-max-frames', 128),
@@ -57,20 +58,30 @@ def automatic_topology(devices, size=2):
 
 def launch_auto(a, values):
     import torch
-    if torch.version.cuda is None or torch.version.hip is not None or not torch.cuda.is_available():
-        raise RuntimeError('Require NVIDIA CUDA PyTorch and available NVIDIA GPUs')
-    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if not torch.cuda.is_available() or not (torch.version.cuda or torch.version.hip):
+        raise RuntimeError('Require available CUDA or HIP GPUs')
+    visibility = 'HIP_VISIBLE_DEVICES' if torch.version.hip else 'CUDA_VISIBLE_DEVICES'
+    visible = os.environ.get(visibility)
     count = torch.cuda.device_count()
     devices = [d.strip() for d in visible.split(',')] if visible is not None else list(map(str,range(count)))
     if len(devices) != count:
-        raise ValueError('CUDA_VISIBLE_DEVICES differs from the CUDA-visible device count')
+        raise ValueError(f'{visibility} differs from the visible device count')
     workers, used, idle = automatic_topology(devices, a.gpus_per_worker)
     print(f'[auto] visible GPUs={count}; groups={workers}; GPUs/group={a.gpus_per_worker}; '
           f'groups={[used[i:i+a.gpus_per_worker] for i in range(0,len(used),a.gpus_per_worker)]}; unused={idle}', flush=True)
     child_args = [v for v in values if v != '--auto-launch']
     command = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
                f'--nproc_per_node={workers}', str(Path(__file__).resolve()), *child_args]
-    return subprocess.run(command, env=dict(os.environ,CUDA_VISIBLE_DEVICES=','.join(used)), check=False).returncode
+    child_env = device_environment(os.environ, visibility, ','.join(used))
+    return subprocess.run(command, env=child_env, check=False).returncode
+
+
+def device_environment(environment, visibility, devices):
+    result = dict(environment)
+    for key in ('CUDA_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES','ROCR_VISIBLE_DEVICES','HSA_VISIBLE_DEVICES'):
+        result.pop(key, None)
+    result[visibility] = devices
+    return result
 
 
 def group_devices(visible, rank, world, size):
@@ -85,6 +96,8 @@ def wave_size(workers, batch, pending, target, accepted, remaining):
 
 
 def prepare(a):
+    if a.token_local_gate and a.boundary_selective:
+        raise ValueError('Choose --token-local-gate or legacy --boundary-selective, not both')
     for name in ('lr', 'alpha', 'fps', 'clip_fps', 'max_grad_norm', 'decode_timeout'):
         if not math.isfinite(getattr(a, name)) or getattr(a, name) <= 0:
             raise ValueError('Require finite positive '+name)
@@ -134,22 +147,22 @@ def prepare(a):
         samples = samples[:a.max_attempts]
     if len(samples) < a.max_samples:
         raise ValueError('Candidate pool smaller than accepted target')
-    return dict(method='boundary_selective_opd' if a.boundary_selective else 'whole_answer_opd_baseline',
+    return dict(method='top1_local_substitution_opd_v1' if a.token_local_gate else 'boundary_selective_opd' if a.boundary_selective else 'whole_answer_opd_baseline',
         arguments=vars(a), student_checkpoint=student, teacher_checkpoint=teacher,
         selected_heads=heads, heads_sha256=video.sha(a.heads_json), data_stats=stats,
         candidate_count=len(samples), annotation_sha256=video.sha(a.anno_json),
         candidate_samples_sha256=hashlib.sha256(json.dumps(samples, sort_keys=True).encode()).hexdigest(),
         expected_trainable_parameters=2*a.rank*sum(sc['hidden_size']+n*dim for n in counts.values()),
         boundary_policy=dict(epsilon_seconds=a.boundary_epsilon, overall_iou_gate=False,
-            rule='student absolute error minus teacher absolute error > epsilon independently per boundary',
+            rule=('Teacher argmax real-token substitution on actual student trajectory; retain suffix; independent boundary absolute error reduction > epsilon; number termination included' if a.token_local_gate else 'student absolute error minus teacher absolute error > epsilon independently per boundary'),
             invalid='Skip invalid prediction, unsupported format or unreliable token mapping'),
-        objective=('Mean full-vocabulary KL(student || stopgrad teacher) over selected numeric tokens per example; average examples in effective batch'
+        objective=('Mean full-vocabulary KL(student || stopgrad teacher) over ordinary tokens and improving numeric/termination positions; average examples in effective batch' if a.token_local_gate else 'Mean full-vocabulary KL(student || stopgrad teacher) over selected numeric tokens per example; average examples in effective batch'
             if a.boundary_selective else 'Mean full-vocabulary KL over the entire student continuation; average examples in effective batch'),
-        active_gate='Independent boundary absolute errors, no IoU gate' if a.boundary_selective else 'Teacher valid and teacher IoU > student IoU',
+        active_gate='Valid student and reliable actual token offsets; local Top1 gate per boundary; no teacher answer generation or IoU gate' if a.token_local_gate else 'Independent boundary absolute errors, no IoU gate' if a.boundary_selective else 'Teacher valid and teacher IoU > student IoU',
         baseline='Without --boundary-selective: valid teacher greedy IoU strictly greater than greedy student IoU (invalid student IoU=0); full continuation KL',
-        teacher_policy='Independent pretrained 32B, permanently frozen; full-source context plus original-timeline GT clip; no GT answer text',
+        teacher_policy=('Independent frozen 32B; full-source context plus original-timeline GT clip and exact GT text; score student trajectory once' if a.token_local_gate else 'Independent pretrained 32B, permanently frozen; full-source context plus original-timeline GT clip; no GT answer text'),
         student_policy='Normal full-source video/query; current student greedy continuation reused for gate and scoring',
-        rollout_generation=dict(student_do_sample=False, teacher_do_sample=False, num_beams=1,
+        rollout_generation=dict(student_do_sample=False, teacher_do_sample=None if a.token_local_gate else False, teacher_answer_generated=not a.token_local_gate, num_beams=1,
             temperature=None, top_p=None, top_k=None, repetition_penalty=1.,
             max_new_tokens=a.max_new_tokens, policy_version='greedy_v1_20261105'),
         visual_budget='Global source context and reference clip share the total cap; normal student has equal actual visual-token count',
@@ -159,31 +172,55 @@ def prepare(a):
 
 def candidate_gradient(a, student, teacher, processors, sample):
     import torch
+    local = bool(getattr(a, 'token_local_gate', False))
     si, ti, sa, ta, duration = video.training_inputs(processors, sample, a)
     y, sg = video.generate(student, processors[0], si, sample, duration, a, sampled=False)
-    _, tg = video.generate(teacher, processors[1], ti, sample, duration, a, sampled=False)
-    decision = groups = None
+    decision = groups = tg = None
     indices = []
-    if a.boundary_selective:
-        decision, reason = boundary_decision(sg, tg, [sample['gt_start'], sample['gt_end']], a.boundary_epsilon)
-        active = bool(decision and (decision['start'] or decision['end']))
+    log_q = None
+    if local:
+        active, reason = bool(sg['valid']), 'token_local'
         if active:
+            from qwen_token_local_gate import completion_positions
             try:
-                groups = boundary_token_groups(processors[0].tokenizer, y[0].tolist())
-                indices = selected_indices(decision, groups)
+                _, _, groups = completion_positions(processors[0].tokenizer, y[0].tolist())
             except ValueError as error:
                 active, reason = False, 'timestamp_tokens_'+str(error)
     else:
-        active = tg['valid'] and tg['iou'] > sg['iou']
-        reason = 'teacher_improves_iou' if active else 'teacher_not_better_iou'
-        if active:
-            indices = list(range(y.shape[1]))
+        _, tg = video.generate(teacher, processors[1], ti, sample, duration, a, sampled=False)
+        if a.boundary_selective:
+            decision, reason = boundary_decision(sg, tg, [sample['gt_start'], sample['gt_end']], a.boundary_epsilon)
+            active = bool(decision and (decision['start'] or decision['end']))
+            if active:
+                try:
+                    groups = boundary_token_groups(processors[0].tokenizer, y[0].tolist())
+                    indices = selected_indices(decision, groups)
+                except ValueError as error:
+                    active, reason = False, 'timestamp_tokens_'+str(error)
+        else:
+            active = tg['valid'] and tg['iou'] > sg['iou']
+            reason = 'teacher_improves_iou' if active else 'teacher_not_better_iou'
+            if active:
+                indices = list(range(y.shape[1]))
     record = dict(sample=sample, accepted=active, reason=reason, student=sg, teacher=tg,
         boundary=decision, boundary_token_groups=groups, selected_token_indices=indices,
         student_video=sa, teacher_video=ta)
     if active:
         with torch.no_grad():
             teacher_logits = video.scoring_logits(teacher, ti, y)
+            if local:
+                from qwen_token_local_gate import local_gate
+                ids = y[0].tolist()
+                indices, kept, audit = local_gate(processors[0].tokenizer, ids, groups,
+                    teacher_logits[0].argmax(-1).detach().cpu().tolist(),
+                    [sample['gt_start'],sample['gt_end']], a.boundary_epsilon)
+                record.update(token_local_gate=audit, selected_token_indices=indices,
+                    selected_boundary_indices=kept, ordinary_tokens=len(ids)-sum(map(len,groups)))
+                print(f"[answer] {sg.get('output', sg.get('prediction'))!r} GT={[sample['gt_start'],sample['gt_end']]}", flush=True)
+                for entry in audit:
+                    change=(f"value={entry['original_value']:g}->{entry['candidate_value']:g} error={entry['original_error']:g}->{entry['candidate_error']:g}s" if 'candidate_value' in entry else entry['reason'])
+                    print(f"[token-{entry['field']}] pos={entry['position']} {entry['student_piece']!r}->{entry['teacher_piece']!r} {change} {'DISTILL' if entry['accepted'] else 'SKIP'}", flush=True)
+                print(f"[scope] ordinary={record['ordinary_tokens']} boundary={len(kept)} total={len(indices)}/{len(ids)} full-vocab RKL", flush=True)
             log_q = teacher_logits.float().log_softmax(-1).cpu()
             del teacher_logits
         del ti
@@ -208,8 +245,13 @@ def main(argv=None):
     world = int(os.environ.get('WORLD_SIZE', '1'))
     if rank != local:
         raise ValueError('Single-node training only')
-    visible = os.environ.get('CUDA_VISIBLE_DEVICES', ','.join(map(str, range(world*a.gpus_per_worker))))
-    os.environ['CUDA_VISIBLE_DEVICES'] = group_devices(visible, local, world, a.gpus_per_worker)
+    visibility = 'HIP_VISIBLE_DEVICES' if 'HIP_VISIBLE_DEVICES' in os.environ else 'CUDA_VISIBLE_DEVICES'
+    visible = os.environ.get(visibility, ','.join(map(str, range(world*a.gpus_per_worker))))
+    selected_devices = group_devices(visible, local, world, a.gpus_per_worker)
+    environment = device_environment(os.environ, visibility, selected_devices)
+    for key in ('CUDA_VISIBLE_DEVICES','HIP_VISIBLE_DEVICES','ROCR_VISIBLE_DEVICES','HSA_VISIBLE_DEVICES'):
+        os.environ.pop(key, None)
+    os.environ[visibility] = environment[visibility]
     protocol, samples = prepare(a)
     protocol['distributed'] = dict(workers=world, gpus_per_worker=a.gpus_per_worker,
         global_effective_batch=a.grad_accum, reduction='CPU float32 sum / global accepted count')
@@ -271,11 +313,12 @@ def main(argv=None):
         optimizer = torch.optim.AdamW([p for _, p in params], lr=a.lr, weight_decay=0.)
         optimizer.zero_grad(set_to_none=True)
         initial = adapter_digest(params)
-        protocol['workers'] = gather(dict(rank=rank, physical_gpus=os.environ['CUDA_VISIBLE_DEVICES'],
+        protocol['workers'] = gather(dict(rank=rank, physical_gpus=os.environ[visibility], visibility_variable=visibility,
             teacher_device_map=teacher.hf_device_map, runtime=video.runtime_identity()))
         if rank == 0:
             video.write(out/'training_metadata.json', protocol)
         reasons, selection_counts, trained = Counter(), Counter(), []
+        progress_started = time.monotonic()
         while processed < len(samples) and accepted < a.max_samples:
             count = wave_size(world, a.grad_accum, pending, a.max_samples, accepted, len(samples)-processed)
             record = None
@@ -286,6 +329,8 @@ def main(argv=None):
             for row in gather(record)[:count]:
                 reasons[row['reason']] += 1
                 if row['accepted']:
+                    for token in row.get('token_local_gate', []):
+                        selection_counts[token['field'] + ('_distill' if token['accepted'] else '_skip')] += 1
                     accepted += 1
                     pending += 1
                     if row['boundary']:
@@ -316,6 +361,11 @@ def main(argv=None):
                     video.write(folder/'summary.json', dict(optimizer_steps=steps, accepted_events=accepted,
                         candidate_events=processed, gradient_norm=float(norm)))
             if rank == 0:
+                elapsed=time.monotonic()-progress_started
+                eta=elapsed/accepted*max(0,a.max_samples-accepted) if accepted else None
+                video.append(out/'progress.jsonl',dict(candidates=processed,accepted=accepted,target=a.max_samples,elapsed_seconds=elapsed,estimated_remaining_seconds=eta))
+                eta_text=f'{eta/3600:.2f}h' if eta is not None else 'pending'
+                print(f'[progress] accepted={accepted}/{a.max_samples} ({100*accepted/a.max_samples:.1f}%) elapsed={elapsed/3600:.2f}h ETA~{eta_text}',flush=True)
                 print(f'[OPD] candidates={processed} accepted={accepted}/{a.max_samples} steps={steps} pending={pending} selections={dict(selection_counts)}', flush=True)
         hashes = gather(adapter_digest(params))
         if len(set(hashes)) != 1:
@@ -375,3 +425,4 @@ def adapter_digest(params):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
