@@ -81,6 +81,16 @@ env -u CUDA_VISIBLE_DEVICES -u ROCR_VISIBLE_DEVICES -u HSA_VISIBLE_DEVICES \
 
 NVIDIA 使用 `CUDA_VISIBLE_DEVICES=0,1`。每两卡一组学生/教师；2/4/6/8卡对应1/2/3/4个同步样本工作组。全局目标不乘以工作组数。学生在组内第一卡，32B 教师自动分片；默认开启学生中间张量 CPU 卸载。
 
+启动脚本会从代码目录向父目录查找同时包含 `shared_models` 和 `Lkmllm_data` 的位置，因此 clone 到项目内的 `HOPD/` 后也能找到已有模型与数据。若 clone 放在其他位置，设置 `LK_OPD_ROOT`。`PY` 默认使用当前环境的 `python`，可显式指定 K100 环境解释器：
+
+```bash
+LK_OPD_ROOT=/fs0/AI/sx2624011/LKOPD/LK_OPD \
+PY=/fs0/AI/sx2624011/LKOPD/LK_OPD/Lkmllm_data/envs/timelens7b_dcu/bin/python \
+bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
+```
+
+上述命令从仓库根目录执行，自动检测全部可见 GPU。也可预先设置 `HIP_VISIBLE_DEVICES=0,1` 或 `CUDA_VISIBLE_DEVICES=0,1` 限定设备；脚本依据所选 Python 的 CUDA/HIP 后端清理冲突的设备变量。默认开启 CPU 中间张量卸载，`CPU_OFFLOAD=0` 可显式关闭，需先确认显存足够。训练目标默认全局 2000 条有效样本，CLI 仍可覆盖做冒烟；无需另外拼接训练参数。
+
 自定义 `STUDENT`、`TEACHER`、`ANNO`、`VIDEOS`、`OUT` 环境变量可以指定实际路径。有效 target 耗尽前候选不足会保存 partial-adapter 并报错，不伪报完成。快照仅保存权重，不是完整优化器/RNG恢复。已运行的旧进程不会自动切换新协议。
 
 ## 测评
@@ -104,7 +114,7 @@ env -u CUDA_VISIBLE_DEVICES -u ROCR_VISIBLE_DEVICES -u HSA_VISIBLE_DEVICES \
 
 `--token-local-gate` 是启动脚本的新默认方法。Python 入口保留旧 `--boundary-selective` 和整体 IoU 门控控制模式；与 token-local 开关互斥。它们仍使用各自的历史逻辑，不与新 Top10 结果混写。
 
-本次 CPU 检查覆盖 Top10 同候选集加权误差、Top1/整组结论不同、起止边界交叉、零有效位置跳过反向、一次教师评分、实际 token 前缀保持不变、纯秒数提示与 HIP 隔离：41 项通过；3 项 PyTorch 数值检查因本地没有 PyTorch 跳过。GPU 训练、K100 速度、显存和独立测试集效果待服务器验证。
+本次 CPU 检查覆盖 Top10 同候选集加权误差、Top1/整组结论不同、起止边界交叉、零有效位置跳过反向、一次教师评分、实际 token 前缀保持不变、纯秒数提示与 HIP 隔离：44 项通过（含 3 项实际 Bash 启动脚本检查，使用假解释器而不加载模型）；3 项 PyTorch 数值检查因本地没有 PyTorch 跳过。GPU 训练、K100 速度、显存和独立测试集效果待服务器验证。
 
 ```bash
 python -m unittest discover -s scripts -p 'test_*.py' -v
