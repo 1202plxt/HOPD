@@ -21,6 +21,8 @@ def parser():
     p.add_argument('--fps', type=float, default=2.)
     p.add_argument('--max-new-tokens', type=int, default=1024)
     p.add_argument('--max-samples', type=int, default=0)
+    p.add_argument('--prompt-mode', choices=('official', 'decimal_seconds'), default='decimal_seconds',
+                   help='decimal_seconds adds the same seconds-only instruction as Top10 training')
     p.add_argument('--decode-timeout', type=float, default=600.)
     p.add_argument('--shard-index', type=int, default=0)
     p.add_argument('--shard-count', type=int, default=1)
@@ -29,6 +31,8 @@ def parser():
 
 def main():
     a = parser().parse_args()
+    from qwen_token_local_gate import SECONDS_INSTRUCTION
+    prompt_suffix = SECONDS_INSTRUCTION if a.prompt_mode == 'decimal_seconds' else ''
     if '/' in a.split or '\\' in a.split or a.split in ('.', '..'):
         raise ValueError('split must be a filename label')
     if min(a.total_tokens, a.min_tokens, a.max_new_tokens) < 1 or a.max_samples < 0:
@@ -58,7 +62,7 @@ def main():
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     out.mkdir(parents=True, exist_ok=True)
-    video.write(out/'protocol.json', dict(arguments=vars(a), prompt='Normal full-source video/query only',
+    video.write(out/'protocol.json', dict(arguments=vars(a), prompt='Normal full-source video/query only', prompt_suffix=prompt_suffix,
         model=video.checkpoint_identity(a.model_path), annotation_sha256=video.sha(a.anno_json),
         failures='All selected rows remain in denominator; failures count zero', runtime=video.runtime_identity(),
         source_sha256={p.name:video.sha(p) for p in [Path(__file__), Path(video.__file__)]}))
@@ -75,7 +79,7 @@ def main():
                 else:
                     # Only video/query reach the model; GT remains outside input construction.
                     inputs, audit = video.normal_input(processor, dict(video_path=str(path), query=sample['query']),
-                        a.total_tokens, a.min_tokens, a.fps, a.max_frames)
+                        a.total_tokens, a.min_tokens, a.fps, a.max_frames, prompt_suffix=prompt_suffix)
                     _, result = video.generate(model, processor, inputs, sample, audit['duration'], a)
                     row.update(result, video=audit, status='ok' if result['valid'] else 'parse_fail')
             except torch.OutOfMemoryError as error:
@@ -103,3 +107,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

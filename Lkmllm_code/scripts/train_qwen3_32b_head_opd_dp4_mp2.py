@@ -24,7 +24,7 @@ def parser():
     for name in ('student-path', 'teacher-path', 'anno-json', 'video-dir', 'output-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--heads-json', default=str(ROOT/'heads/qwen3_gtmask_top10.json'))
-    p.add_argument('--token-local-gate', action='store_true', help='One teacher scoring pass; Top1 substitution gate; full-vocabulary KL on ordinary and improving timestamp positions')
+    p.add_argument('--token-local-gate', action='store_true', help='One teacher score; Top10 probability-weighted independent boundary-error gate; full-vocabulary KL on ordinary and accepted boundary positions')
     p.add_argument('--boundary-selective', action='store_true',
                    help='Independent boundary-error gate and selected-number-token KL; otherwise whole-answer IoU-gated baseline')
     p.add_argument('--boundary-epsilon', type=float, default=0., help='Strict improvement margin in seconds')
@@ -147,18 +147,22 @@ def prepare(a):
         samples = samples[:a.max_attempts]
     if len(samples) < a.max_samples:
         raise ValueError('Candidate pool smaller than accepted target')
-    return dict(method='top1_local_substitution_opd_v1' if a.token_local_gate else 'boundary_selective_opd' if a.boundary_selective else 'whole_answer_opd_baseline',
+    from qwen_token_local_gate import TOP10_POLICY, SECONDS_INSTRUCTION
+    return dict(method='top10_independent_expected_error_seconds_opd_v2' if a.token_local_gate else 'boundary_selective_opd' if a.boundary_selective else 'whole_answer_opd_baseline',
         arguments=vars(a), student_checkpoint=student, teacher_checkpoint=teacher,
         selected_heads=heads, heads_sha256=video.sha(a.heads_json), data_stats=stats,
         candidate_count=len(samples), annotation_sha256=video.sha(a.anno_json),
         candidate_samples_sha256=hashlib.sha256(json.dumps(samples, sort_keys=True).encode()).hexdigest(),
         expected_trainable_parameters=2*a.rank*sum(sc['hidden_size']+n*dim for n in counts.values()),
         boundary_policy=dict(epsilon_seconds=a.boundary_epsilon, overall_iou_gate=False,
-            rule=('Teacher argmax real-token substitution on actual student trajectory; retain suffix; independent boundary absolute error reduction > epsilon; number termination included' if a.token_local_gate else 'student absolute error minus teacher absolute error > epsilon independently per boundary'),
+            rule=(TOP10_POLICY['criterion'] if a.token_local_gate else 'student absolute error minus teacher absolute error > epsilon independently per boundary'),
             invalid='Skip invalid prediction, unsupported format or unreliable token mapping'),
+        token_local_policy=(dict(TOP10_POLICY, epsilon_seconds=a.boundary_epsilon) if a.token_local_gate else None),
+        prompt_suffix=SECONDS_INSTRUCTION if a.token_local_gate else '',
+        sample_acceptance=(TOP10_POLICY['sample_acceptance'] if a.token_local_gate else 'Historical gate'),
         objective=('Mean full-vocabulary KL(student || stopgrad teacher) over ordinary tokens and improving numeric/termination positions; average examples in effective batch' if a.token_local_gate else 'Mean full-vocabulary KL(student || stopgrad teacher) over selected numeric tokens per example; average examples in effective batch'
             if a.boundary_selective else 'Mean full-vocabulary KL over the entire student continuation; average examples in effective batch'),
-        active_gate='Valid student and reliable actual token offsets; local Top1 gate per boundary; no teacher answer generation or IoU gate' if a.token_local_gate else 'Independent boundary absolute errors, no IoU gate' if a.boundary_selective else 'Teacher valid and teacher IoU > student IoU',
+        active_gate='Teacher Top10 expected error strictly below both student expected error on the same valid candidates and original boundary error; at least one boundary position; no ordering constraint on hypothetical replacements' if a.token_local_gate else 'Independent boundary absolute errors, no IoU gate' if a.boundary_selective else 'Teacher valid and teacher IoU > student IoU',
         baseline='Without --boundary-selective: valid teacher greedy IoU strictly greater than greedy student IoU (invalid student IoU=0); full continuation KL',
         teacher_policy=('Independent frozen 32B; full-source context plus original-timeline GT clip and exact GT text; score student trajectory once' if a.token_local_gate else 'Independent pretrained 32B, permanently frozen; full-source context plus original-timeline GT clip; no GT answer text'),
         student_policy='Normal full-source video/query; current student greedy continuation reused for gate and scoring',
@@ -181,8 +185,9 @@ def candidate_gradient(a, student, teacher, processors, sample):
     if local:
         active, reason = bool(sg['valid']), 'token_local'
         if active:
-            from qwen_token_local_gate import completion_positions
+            from qwen_token_local_gate import completion_positions, validate_seconds_answer
             try:
+                validate_seconds_answer(processors[0].tokenizer, y[0].tolist())
                 _, _, groups = completion_positions(processors[0].tokenizer, y[0].tolist())
             except ValueError as error:
                 active, reason = False, 'timestamp_tokens_'+str(error)
@@ -208,19 +213,6 @@ def candidate_gradient(a, student, teacher, processors, sample):
     if active:
         with torch.no_grad():
             teacher_logits = video.scoring_logits(teacher, ti, y)
-            if local:
-                from qwen_token_local_gate import local_gate
-                ids = y[0].tolist()
-                indices, kept, audit = local_gate(processors[0].tokenizer, ids, groups,
-                    teacher_logits[0].argmax(-1).detach().cpu().tolist(),
-                    [sample['gt_start'],sample['gt_end']], a.boundary_epsilon)
-                record.update(token_local_gate=audit, selected_token_indices=indices,
-                    selected_boundary_indices=kept, ordinary_tokens=len(ids)-sum(map(len,groups)))
-                print(f"[answer] {sg.get('output', sg.get('prediction'))!r} GT={[sample['gt_start'],sample['gt_end']]}", flush=True)
-                for entry in audit:
-                    change=(f"value={entry['original_value']:g}->{entry['candidate_value']:g} error={entry['original_error']:g}->{entry['candidate_error']:g}s" if 'candidate_value' in entry else entry['reason'])
-                    print(f"[token-{entry['field']}] pos={entry['position']} {entry['student_piece']!r}->{entry['teacher_piece']!r} {change} {'DISTILL' if entry['accepted'] else 'SKIP'}", flush=True)
-                print(f"[scope] ordinary={record['ordinary_tokens']} boundary={len(kept)} total={len(indices)}/{len(ids)} full-vocab RKL", flush=True)
             log_q = teacher_logits.float().log_softmax(-1).cpu()
             del teacher_logits
         del ti
@@ -228,6 +220,21 @@ def candidate_gradient(a, student, teacher, processors, sample):
         context = torch.autograd.graph.save_on_cpu(pin_memory=True) if a.offload_saved_tensors else contextlib.nullcontext()
         with context:
             logits = video.scoring_logits(student, si, y)
+            if local:
+                from qwen_token_local_gate import topk_gate, gate_change
+                ids = y[0].tolist()
+                indices, kept, audit = topk_gate(processors[0].tokenizer, ids, groups,
+                    log_q[0], logits[0], [sample['gt_start'],sample['gt_end']], a.boundary_epsilon)
+                record.update(accepted=bool(kept),
+                    reason='top10_expected_error_improved' if kept else 'no_top10_effective_position',
+                    token_local_gate=audit, selected_token_indices=indices,
+                    selected_boundary_indices=kept, ordinary_tokens=len(ids)-sum(map(len,groups)))
+                print(f"[answer] {sg.get('output', sg.get('prediction'))!r} GT={[sample['gt_start'],sample['gt_end']]}", flush=True)
+                for entry in audit:
+                    print(f"[token-{entry['field']}] pos={entry['position']} {entry['student_piece']!r}->{entry['teacher_piece']!r} {gate_change(entry)} {'DISTILL' if entry['accepted'] else 'SKIP'}", flush=True)
+                print(f"[scope] ordinary={record['ordinary_tokens']} boundary={len(kept)} total={len(indices)}/{len(ids)} full-vocab RKL", flush=True)
+                if not kept:
+                    return record
             loss = reverse_kl(logits, log_q, indices)
         if not torch.isfinite(loss):
             raise RuntimeError('Nonfinite reverse KL')
@@ -425,4 +432,5 @@ def adapter_digest(params):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

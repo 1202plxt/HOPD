@@ -1,4 +1,4 @@
-"""CPU regressions for Top1 gating and one-pass teacher scoring."""
+"""CPU regressions for independent token gates and one-pass teacher scoring."""
 import contextlib
 import io
 import json
@@ -66,7 +66,7 @@ class LocalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Shared'):
             completion_positions(Fused(),[0,1,2])
 
-    def test_default_script_is_global_2k_and_top1(self):
+    def test_default_script_is_global_2k_and_top10(self):
         a=train.parser().parse_args(['--student-path','s','--teacher-path','t','--anno-json','a','--video-dir','v','--output-dir','o'])
         self.assertEqual(a.max_samples,2000)
         shell=(Path(train.__file__).parent/'run_head_opd_8gpu.sh').read_text()
@@ -108,15 +108,40 @@ class LocalTests(unittest.TestCase):
         args=SimpleNamespace(token_local_gate=True,boundary_selective=False,boundary_epsilon=0.,offload_saved_tensors=False)
         fake=SimpleNamespace(no_grad=contextlib.nullcontext,isfinite=lambda value:True)
         sg=dict(valid=True,prediction=[14,45],output='The event happens in 14 - 45 seconds.')
-        with patch.dict(sys.modules,{'torch':fake}),patch.object(train.video,'training_inputs',return_value=({}, {}, {}, {},100.)),patch.object(train.video,'generate',return_value=(Tokens(),sg)) as generate,patch.object(train.video,'scoring_logits',side_effect=[TeacherLogits(),object()]) as score,patch.object(train,'reverse_kl',return_value=loss) as kl,contextlib.redirect_stdout(io.StringIO()):
+        with patch.dict(sys.modules,{'torch':fake}),patch.object(train.video,'training_inputs',return_value=({}, {}, {}, {},100.)),patch.object(train.video,'generate',return_value=(Tokens(),sg)) as generate,patch.object(train.video,'scoring_logits',side_effect=[TeacherLogits(),TeacherLogits()]) as score,patch('qwen_token_local_gate.topk_gate',return_value=([0,1,3],[1,3],[])) as gate,patch.object(train,'reverse_kl',return_value=loss) as kl,contextlib.redirect_stdout(io.StringIO()):
             row=train.candidate_gradient(args,student,teacher,[SimpleNamespace(tokenizer=Pieces()),None],dict(gt_start=24,gt_end=80))
         self.assertEqual(generate.call_count,1)
         self.assertIs(generate.call_args.args[0],student)
         self.assertEqual([call.args[0] for call in score.call_args_list],[teacher,student])
+        gate.assert_called_once()
+        self.assertTrue(row['accepted'])
         self.assertEqual(row['selected_token_indices'],[0,1,3])
         self.assertEqual(kl.call_args.args[2],[0,1,3])
         loss.backward.assert_called_once()
 
+    def test_zero_effective_positions_skip_kl_and_backward(self):
+        class Tokens:
+            shape=(1,5)
+            def __getitem__(self,key): return self
+            def tolist(self): return [0,1,2,3,4]
+        tok=SimpleNamespace(all_special_ids=[],decode=lambda ids,**kw: ''.join(
+            ['The event happens in ','14',' - ','45',' seconds.'][i] for i in ids))
+        class Scores:
+            def __getitem__(self,key): return self
+            def float(self): return self
+            def log_softmax(self,*args): return self
+            def cpu(self): return self
+        args=SimpleNamespace(token_local_gate=True,boundary_selective=False,boundary_epsilon=0.,offload_saved_tensors=False)
+        fake=SimpleNamespace(no_grad=contextlib.nullcontext,isfinite=lambda value:True)
+        sg=dict(valid=True,prediction=[14,45])
+        with patch.dict(sys.modules,{'torch':fake}),patch.object(train.video,'training_inputs',return_value=({}, {}, {}, {},100.)),patch.object(train.video,'generate',return_value=(Tokens(),sg)),patch.object(train.video,'scoring_logits',side_effect=[Scores(),Scores()]),patch('qwen_token_local_gate.topk_gate',return_value=([],[],[])),patch.object(train,'reverse_kl') as kl,contextlib.redirect_stdout(io.StringIO()):
+            row=train.candidate_gradient(args,SimpleNamespace(train=Mock()),object(),[SimpleNamespace(tokenizer=tok),None],dict(gt_start=24,gt_end=80))
+        self.assertFalse(row['accepted'])
+        self.assertEqual(row['reason'],'no_top10_effective_position')
+        self.assertEqual(row['selected_token_indices'],[])
+        kl.assert_not_called()
+
 
 if __name__=='__main__':
     unittest.main()
+

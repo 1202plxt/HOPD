@@ -324,6 +324,8 @@ def build_gt_clip_input(processor, sample, pool, mode, a):
     content.insert(2, dict(type='text',text=GT_CLIP_GUIDANCE+'\nReference clip:'))
     content.insert(3, dict(type='video',video=sample['video_path']))
     if getattr(a,'token_local_gate',False):
+        from qwen_token_local_gate import SECONDS_INSTRUCTION
+        content[-1]['text'] += SECONDS_INSTRUCTION
         content[-1]['text'] += (f"\nThe reference temporal interval is {sample['gt_start']} to {sample['gt_end']} seconds. Analyze the video evidence and give your own prediction.")
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = dict(processor(text=[text], videos=[global_tensor,clip_tensor],
@@ -426,6 +428,9 @@ def training_inputs(processors, sample, a):
     meta = copy.deepcopy(pool['metadata'])
     meta['frames_indices'] = [pool['indices'][i] for i in positions]
     messages = core.messages_for(sample, dict(type='video',video=sample['video_path']))
+    if getattr(a, 'token_local_gate', False):
+        from qwen_token_local_gate import SECONDS_INSTRUCTION
+        messages[-1]['content'][-1]['text'] += SECONDS_INSTRUCTION
     text = processors[0].apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     student = dict(processors[0](text=[text], videos=[pool['frames'][positions]], video_metadata=[meta],
         return_tensors='pt', padding=True, **dict(pool['options'],do_resize=False,do_sample_frames=False)))
@@ -448,7 +453,7 @@ def metrics(rows):
                 **{f'R@{t}': sum(v >= t for v in values)/n if n else None for t in (.3, .5, .7)})
 
 
-def normal_input(processor, sample, total_tokens, min_tokens, fps, max_frames=0):
+def normal_input(processor, sample, total_tokens, min_tokens, fps, max_frames=0, prompt_suffix=''):
     """Direct native video input with its OWN budget; no GT-based selection or prompt.
 
     Native decoder chooses time points from fps/cap. Spatial resizing uses this
@@ -465,6 +470,7 @@ def normal_input(processor, sample, total_tokens, min_tokens, fps, max_frames=0)
     if max_frames:
         video['max_frames'] = max_frames
     messages = core.messages_for(sample, video, privileged=False, prompt_mode='official')
+    messages[-1]['content'][-1]['text'] += prompt_suffix
     images, videos, options = decoder.process_vision_info(messages, image_patch_size=patch,
         return_video_kwargs=True, return_video_metadata=True)
     if images or len(videos) != 1:
@@ -509,4 +515,5 @@ def normal_input(processor, sample, total_tokens, min_tokens, fps, max_frames=0)
         user_prompt=messages[-1]['content'][-1]['text'], guidance_applied=False,
         processing='native branch-specific resize; cap whole groups uniformly; preserve original timestamps')
     return inputs, audit
+
 

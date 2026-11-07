@@ -11,6 +11,17 @@ import probe_qwen32b_privileged_k100 as video
 from e_head_eval import load_samples
 
 
+def worker_visibility_environment(parent, device, hip):
+    env = dict(parent)
+    if hip:
+        for name in ('CUDA_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'HSA_VISIBLE_DEVICES'):
+            env.pop(name, None)
+        env['HIP_VISIBLE_DEVICES'] = device
+    else:
+        env['CUDA_VISIBLE_DEVICES'] = device
+    return env
+
+
 def main():
     a = evaluation.parser().parse_args()
     if a.shard_index != 0 or a.shard_count != 1:
@@ -19,7 +30,8 @@ def main():
     if out.exists() and any(out.iterdir()):
         raise FileExistsError('Use a new empty output directory')
     import torch
-    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    hip = bool(getattr(torch.version, 'hip', None))
+    visible = os.environ.get('HIP_VISIBLE_DEVICES' if hip else 'CUDA_VISIBLE_DEVICES')
     ids = visible.split(',') if visible else list(map(str,range(torch.cuda.device_count())))
     if not ids or len(set(ids)) != len(ids) or torch.cuda.device_count() != len(ids):
         raise ValueError('Invalid visible GPU configuration')
@@ -36,7 +48,7 @@ def main():
             stream = (out/f'worker{rank}.log').open('w',encoding='utf-8')
             streams.append(stream)
             processes.append(subprocess.Popen([sys.executable,'-u',str(Path(evaluation.__file__)),*args],
-                env=dict(os.environ,CUDA_VISIBLE_DEVICES=device.strip()),stdout=stream,stderr=subprocess.STDOUT))
+                env=worker_visibility_environment(os.environ, device.strip(), hip),stdout=stream,stderr=subprocess.STDOUT))
         while any(p.poll() is None for p in processes):
             if any(p.poll() not in (None,0) for p in processes):
                 raise RuntimeError('Evaluation worker failed; inspect worker logs')
@@ -78,3 +90,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
