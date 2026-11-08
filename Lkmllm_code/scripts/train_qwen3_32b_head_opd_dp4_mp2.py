@@ -24,6 +24,11 @@ def parser():
     for name in ('student-path', 'teacher-path', 'anno-json', 'video-dir', 'output-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--heads-json', default=str(ROOT/'heads/qwen3_gtmask_top10.json'))
+    p.add_argument('--rounds', type=int, default=1, help='Each round accepts max-samples NEW events; preserve student and optimizer')
+    p.add_argument('--duration-ratio', nargs=3, type=int, default=None, metavar=('SHORT','MEDIUM','LONG'))
+    p.add_argument('--distill-kl', choices=('reverse',), default='reverse', help='Full-vocabulary RKL; Top10 is only the gate')
+    p.add_argument('--quiet', action='store_true')
+    p.add_argument('--log-every', type=int, default=10)
     p.add_argument('--token-local-gate', action='store_true', help='One teacher score; Top10 probability-weighted independent boundary-error gate; full-vocabulary KL on ordinary and accepted boundary positions')
     p.add_argument('--boundary-selective', action='store_true',
                    help='Independent boundary-error gate and selected-number-token KL; otherwise whole-answer IoU-gated baseline')
@@ -96,6 +101,8 @@ def wave_size(workers, batch, pending, target, accepted, remaining):
 
 
 def prepare(a):
+    if a.rounds < 1 or a.log_every < 1 or (a.rounds > 1 and not a.duration_ratio):
+        raise ValueError('Require positive rounds/log-every; multiple rounds require duration-ratio')
     if a.token_local_gate and a.boundary_selective:
         raise ValueError('Choose --token-local-gate or legacy --boundary-selective, not both')
     for name in ('lr', 'alpha', 'fps', 'clip_fps', 'max_grad_norm', 'decode_timeout'):
@@ -143,7 +150,7 @@ def prepare(a):
     counts = Counter(h['layer'] for h in heads)
     dim = sc.get('head_dim', sc['hidden_size']//sc['num_attention_heads'])
     samples, stats = modeling.load_samples(a.anno_json, a.video_dir, 0, a.seed)
-    if a.max_attempts:
+    if a.max_attempts and not a.duration_ratio:
         samples = samples[:a.max_attempts]
     if len(samples) < a.max_samples:
         raise ValueError('Candidate pool smaller than accepted target')
@@ -229,10 +236,11 @@ def candidate_gradient(a, student, teacher, processors, sample):
                     reason='top10_expected_error_improved' if kept else 'no_top10_effective_position',
                     token_local_gate=audit, selected_token_indices=indices,
                     selected_boundary_indices=kept, ordinary_tokens=len(ids)-sum(map(len,groups)))
-                print(f"[answer] {sg.get('output', sg.get('prediction'))!r} GT={[sample['gt_start'],sample['gt_end']]}", flush=True)
-                for entry in audit:
-                    print(f"[token-{entry['field']}] pos={entry['position']} {entry['student_piece']!r}->{entry['teacher_piece']!r} {gate_change(entry)} {'DISTILL' if entry['accepted'] else 'SKIP'}", flush=True)
-                print(f"[scope] ordinary={record['ordinary_tokens']} boundary={len(kept)} total={len(indices)}/{len(ids)} full-vocab RKL", flush=True)
+                if not getattr(a, 'quiet', False):
+                    print(f"[answer] {sg.get('output', sg.get('prediction'))!r} GT={[sample['gt_start'],sample['gt_end']]}", flush=True)
+                    for entry in audit:
+                        print(f"[token-{entry['field']}] pos={entry['position']} {entry['student_piece']!r}->{entry['teacher_piece']!r} {gate_change(entry)} {'DISTILL' if entry['accepted'] else 'SKIP'}", flush=True)
+                    print(f"[scope] ordinary={record['ordinary_tokens']} boundary={len(kept)} total={len(indices)}/{len(ids)} full-vocab RKL", flush=True)
                 if not kept:
                     return record
             loss = reverse_kl(logits, log_q, indices)
@@ -260,6 +268,15 @@ def main(argv=None):
         os.environ.pop(key, None)
     os.environ[visibility] = environment[visibility]
     protocol, samples = prepare(a)
+    sampler = None
+    target = a.max_samples * a.rounds
+    if a.duration_ratio:
+        from opd_duration_sampler import DurationRounds
+        sampler = DurationRounds(samples, a.max_samples, rounds=a.rounds,
+            ratio=a.duration_ratio, seed=a.seed, max_attempts=a.max_attempts)
+        protocol['duration_sampling'] = sampler.describe()
+    protocol['accepted_target_global'] = target
+    protocol['round_policy'] = 'Continuous student, Head-LoRA and AdamW; frozen teacher; no candidate reuse across rounds'
     protocol['distributed'] = dict(workers=world, gpus_per_worker=a.gpus_per_worker,
         global_effective_batch=a.grad_accum, reduction='CPU float32 sum / global accepted count')
     if a.plan_only:
@@ -326,14 +343,26 @@ def main(argv=None):
             video.write(out/'training_metadata.json', protocol)
         reasons, selection_counts, trained = Counter(), Counter(), []
         progress_started = time.monotonic()
-        while processed < len(samples) and accepted < a.max_samples:
-            count = wave_size(world, a.grad_accum, pending, a.max_samples, accepted, len(samples)-processed)
+        while processed < len(samples) and accepted < target:
+            if sampler and sampler.accepted == sampler.quotas:
+                if not sampler.advance_round():
+                    break
+            count = wave_size(world, a.grad_accum, pending, target, accepted, len(samples)-processed)
+            wave = sampler.take_wave(count) if sampler else samples[processed:processed+count]
+            count = len(wave)
+            if not count:
+                break
             record = None
             if rank < count:
                 started = time.monotonic()
-                record = candidate_gradient(a, student, teacher, processors, samples[processed+rank])
+                record = candidate_gradient(a, student, teacher, processors, wave[rank])
                 record.update(candidate=processed+rank+1, worker_rank=rank, seconds=time.monotonic()-started)
-            for row in gather(record)[:count]:
+                if sampler:
+                    record.update(round=sampler.round_index, duration_bucket=sampler.current)
+            records = gather(record)[:count]
+            if sampler:
+                sampler.finish_wave([bool(row['accepted']) for row in records])
+            for row in records:
                 reasons[row['reason']] += 1
                 if row['accepted']:
                     for token in row.get('token_local_gate', []):
@@ -349,7 +378,7 @@ def main(argv=None):
                 if rank == 0:
                     video.append(out/'train.jsonl', dict(row, accepted_total=accepted, optimizer_steps_before=steps))
             processed += count
-            if pending and (pending == a.grad_accum or accepted == a.max_samples or processed == len(samples)):
+            if pending and (pending == a.grad_accum or accepted == target or processed == len(samples)):
                 for name, p in params:
                     value = torch.zeros(p.shape, dtype=torch.float32) if p.grad is None else p.grad.detach().float().cpu()
                     if world > 1:
@@ -369,17 +398,22 @@ def main(argv=None):
                         candidate_events=processed, gradient_norm=float(norm)))
             if rank == 0:
                 elapsed=time.monotonic()-progress_started
-                eta=elapsed/accepted*max(0,a.max_samples-accepted) if accepted else None
-                video.append(out/'progress.jsonl',dict(candidates=processed,accepted=accepted,target=a.max_samples,elapsed_seconds=elapsed,estimated_remaining_seconds=eta))
+                eta=elapsed/accepted*max(0,target-accepted) if accepted else None
+                video.append(out/'progress.jsonl',dict(candidates=processed,accepted=accepted,target=target,elapsed_seconds=elapsed,estimated_remaining_seconds=eta))
                 eta_text=f'{eta/3600:.2f}h' if eta is not None else 'pending'
-                print(f'[progress] accepted={accepted}/{a.max_samples} ({100*accepted/a.max_samples:.1f}%) elapsed={elapsed/3600:.2f}h ETA~{eta_text}',flush=True)
-                print(f'[OPD] candidates={processed} accepted={accepted}/{a.max_samples} steps={steps} pending={pending} selections={dict(selection_counts)}', flush=True)
+                if not a.quiet or processed % a.log_every < count or accepted == target:
+                    print(f'[OPD] candidates={processed} accepted={accepted}/{target} steps={steps} '
+                          f'round={sampler.round_index if sampler else 1}/{a.rounds} elapsed={elapsed/3600:.2f}h ETA~{eta_text}', flush=True)
+        if sampler and sampler.accepted == sampler.quotas and sampler.round_index == a.rounds:
+            sampler.advance_round()
         hashes = gather(adapter_digest(params))
         if len(set(hashes)) != 1:
             raise RuntimeError('Student replicas diverged')
-        success = accepted == a.max_samples and hashes[0] != initial
+        success = accepted == target and hashes[0] != initial
         summary = dict(training_complete=success, accepted_events=accepted, candidate_events=processed,
-            accepted_target=a.max_samples, optimizer_steps=steps, gate_counts=dict(reasons),
+            accepted_target=target, accepted_per_round=a.max_samples, rounds=a.rounds,
+            duration_sampling=sampler.describe() if sampler else None,
+            kl_direction='reverse', optimizer_steps=steps, gate_counts=dict(reasons),
             boundary_selection_counts=dict(selection_counts), merged=False,
             initial_adapter_sha256=initial, final_adapter_sha256=hashes[0], worker_adapter_sha256=hashes)
         if rank == 0:

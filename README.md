@@ -2,7 +2,7 @@
 
 2026-11-07：将启动脚本使用的 token-local 模式从 Top1 升级为 **Top10 概率加权边界误差门控**，并移除假设替换的 `start < end` 约束。该版本与旧 Top1 训练属于不同协议，使用新输出目录；历史测评结果不归属于本次更新。
 
-默认目标仍为全局 **2000 个有效样本**，有效 batch=4，达到目标时共 500 次更新。可用 `--max-samples 1000` 改为 1000 个有效样本、250 次更新。
+2026-11-08：双卡 NVIDIA 启动脚本默认 **RKL、每轮2000条有效样本、连续两轮**，共4000条、有效batch=4、1000次更新；训练完成并导出完整权重后自动进行三套双卡分样本测评。每轮GT时长配额为2∶4∶4。此前实验分数不归入此协议。
 
 ## 门控与蒸馏
 
@@ -60,64 +60,61 @@ LK_OPD/
 
 预算保持现有构造：14336/min64/fps2/maxframes0；教师 GT 参考片段最多4096视觉 token、fps4、128帧，包含在教师总视觉上限中，不是本次额外增加4096。默认使用预选 Qwen3 GT-mask Top10，不重新排名。
 
-## 启动与冒烟
+## 双卡 NVIDIA：训练两轮后自动测评
 
-在 `Lkmllm_code` 目录运行，保留历史启动脚本名：
-
-```bash
-bash scripts/run_head_opd_8gpu.sh --plan-only
-
-OUT="../Lkmllm_data/checkpoints/top10_independent_smoke_$(date +%Y%m%d_%H%M%S)" \
-  bash scripts/run_head_opd_8gpu.sh \
-  --max-samples 8 --max-attempts 100 --save-every-steps 1
-```
-
-双 K100 的环境前缀为：
+在已安装兼容 CUDA PyTorch 的环境中，从仓库根目录执行：
 
 ```bash
-env -u CUDA_VISIBLE_DEVICES -u ROCR_VISIBLE_DEVICES -u HSA_VISIBLE_DEVICES \
-  HIP_VISIBLE_DEVICES=0,1 bash scripts/run_head_opd_8gpu.sh
-```
-
-NVIDIA 使用 `CUDA_VISIBLE_DEVICES=0,1`。每两卡一组学生/教师；2/4/6/8卡对应1/2/3/4个同步样本工作组。全局目标不乘以工作组数。学生在组内第一卡，32B 教师自动分片；默认开启学生中间张量 CPU 卸载。
-
-启动脚本会从代码目录向父目录查找同时包含 `shared_models` 和 `Lkmllm_data` 的位置，因此 clone 到项目内的 `HOPD/` 后也能找到已有模型与数据。若 clone 放在其他位置，设置 `LK_OPD_ROOT`。`PY` 默认使用当前环境的 `python`，可显式指定 K100 环境解释器：
-
-```bash
+CUDA_VISIBLE_DEVICES=0,1 \
 LK_OPD_ROOT=/fs0/AI/sx2624011/LKOPD/LK_OPD \
-PY=/fs0/AI/sx2624011/LKOPD/LK_OPD/Lkmllm_data/envs/timelens7b_dcu/bin/python \
-bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
+bash Lkmllm_code/scripts/run_head_opd_2gpu.sh
 ```
 
-上述命令从仓库根目录执行，自动检测全部可见 GPU。也可预先设置 `HIP_VISIBLE_DEVICES=0,1` 或 `CUDA_VISIBLE_DEVICES=0,1` 限定设备；脚本依据所选 Python 的 CUDA/HIP 后端清理冲突的设备变量。默认开启 CPU 中间张量卸载，`CPU_OFFLOAD=0` 可显式关闭，需先确认显存足够。训练目标默认全局 2000 条有效样本，CLI 仍可覆盖做冒烟；无需另外拼接训练参数。
+`PY` 默认使用当前环境的 `python`；可通过 `PY=/path/to/environment/bin/python` 覆盖。脚本从代码向父目录查找包含 `shared_models` 与 `Lkmllm_data` 的位置，或使用 `LK_OPD_ROOT`。模型与数据默认路径均在脚本中，可以直接修改。原 `run_head_opd_8gpu.sh` 文件名保留，两者现在启动同一套**恰好两卡 NVIDIA**流水线。该 shell 不再自动扩展到其他卡数或 HIP。
 
-自定义 `STUDENT`、`TEACHER`、`ANNO`、`VIDEOS`、`OUT` 环境变量可以指定实际路径。有效 target 耗尽前候选不足会保存 partial-adapter 并报错，不伪报完成。快照仅保存权重，不是完整优化器/RNG恢复。已运行的旧进程不会自动切换新协议。
+默认学生从 `shared_models/Qwen3-VL-8B-Instruct` 起步，教师为冻结的 `Video-opd-teacher-Qwen3-VL-32B-GRPO`。通过 `STUDENT` 可明确覆盖起始完整权重；脚本不会自动载入之前的FKL检查点。双卡训练中学生在第一卡，教师在两卡间分片。
 
-## 测评
+### 两轮与样本分配
 
-测评默认加入相同纯秒数指令；`--prompt-mode official` 可显式使用原始提示。GT 仅用于最后评分，不进入模型输入。
+- 每轮目标2000条**实际接受**样本：GT时长≤5秒400条，5秒<GT时长≤15秒800条，GT时长>15秒800条。
+- 这是GT事件长度分桶，不是视频总时长。>15秒桶仍同时包含15–60秒和>60秒事件。
+- 根据剩余有效配额随机选择分桶。拒绝不计数，继续同桶下一候选；候选预先分桶洗牌，取下一条无需再次扫描整个数据集。
+- 轮间保留同一个学生、Head-LoRA、AdamW和梯度累积状态；教师保持冻结。不重建优化器，不重新挂载LoRA，不重放前轮候选。
+- 两轮合计4000条新有效样本，短/中/长为800/1600/1600，默认1000次参数更新。配额不足或候选耗尽会报错并保留partial，不放宽配额，不进入测评。
 
-```bash
-env -u CUDA_VISIBLE_DEVICES -u ROCR_VISIBLE_DEVICES -u HSA_VISIBLE_DEVICES \
-  HIP_VISIBLE_DEVICES=0,1 python -u scripts/qwen_baseline_eval_dp.py \
-  --model-path "$OUT" \
-  --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
-  --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
-  --output-dir "../Lkmllm_data/outputs/eval_results/$(basename "$OUT")/Qvhighlights" \
-  --split Qvhighlights --prompt-mode decimal_seconds \
-  --fps 2 --min-tokens 64 --total-tokens 14336 --max-frames 0 --max-new-tokens 1024
+参数已写在sh内：`--distill-kl reverse --rounds 2 --max-samples 2000 --duration-ratio 2 4 4 --max-attempts 0 --grad-accum 4`。Top10仍仅用于门控，普通位置与通过边界位置仍使用**全词表RKL**。
+
+训练元数据、逐候选门控审计、轮次、duration_bucket、最终每轮配额与接受样本列表均保留。`--quiet --log-every 10`减少控制台输出，完整JSONL审计不删除。
+
+### 自动测评
+
+训练完成并合并完整学生权重后，依次测评QVHighlights、Charades-STA、ActivityNet。每套均由两张卡独立加载同一学生权重，按样本分片，每条只测一次，最后合并指标。测评进程在训练进程退出、模型释放后启动。
+
+使用训练相同的纯秒数prompt，14336预算、min64、fps2、maxframes0、贪心生成、repetition_penalty=1；测评max_new_tokens=1024。GT只参与评分，不进入模型输入。失败样本计零，不从分母移除。结果放在：
+
+```text
+Lkmllm_data/outputs/eval_results/<训练目录名>_eval14336_dp2/
+  Qvhighlights/
+  Charades_sta/
+  Activitynet/
 ```
 
-双卡按样本分片，每卡一份学生；K100 子进程清除冲突的 CUDA/ROCR/HSA 隔离变量。每个选中样本均计入指标分母，推理失败计零。比较模型时使用相同 prompt、预算和评测配置。
+三个测试集的annotation和视频路径可在sh中修改，或设置 `QV_ANNO/QV_VIDEOS`、`CHARADES_ANNO/CHARADES_VIDEOS`、`ACTIVITYNET_ANNO/ACTIVITYNET_VIDEOS`。脚本在训练前检查路径，防止训练完成后才发现缺少测试集。`OUT`指定新训练目录，`EVAL_OUT`指定新测评根目录。
 
-## 历史模式与验证
+### 冒烟与验证
 
-`--token-local-gate` 是启动脚本的新默认方法。Python 入口保留旧 `--boundary-selective` 和整体 IoU 门控控制模式；与 token-local 开关互斥。它们仍使用各自的历史逻辑，不与新 Top10 结果混写。
-
-本次 CPU 检查覆盖 Top10 同候选集加权误差、Top1/整组结论不同、起止边界交叉、零有效位置跳过反向、一次教师评分、实际 token 前缀保持不变、纯秒数提示与 HIP 隔离：44 项通过（含 3 项实际 Bash 启动脚本检查，使用假解释器而不加载模型）；3 项 PyTorch 数值检查因本地没有 PyTorch 跳过。GPU 训练、K100 速度、显存和独立测试集效果待服务器验证。
+较小目标测试（每轮10条，共20条；完成后仍会跑三套完整测评）：
 
 ```bash
+CUDA_VISIBLE_DEVICES=0,1 bash Lkmllm_code/scripts/run_head_opd_2gpu.sh \
+  --max-samples 10 --save-every-steps 1
+```
+
+只测试训练可直接调用Python入口并使用同一组训练参数；多卡自动分组能力仍保留在Python入口中。快照仅保存权重，并非完整optimizer/RNG恢复。不要复用已有非空输出目录。
+
+本地CPU检查涵盖两轮配额、拒绝重试、不重复、有效batch与1000步计数，以及实际Bash流水线顺序、训练失败/未合并时阻止测评、缺少测试集时提前失败。未进行真实NVIDIA训练、显存或速度验证。
+
+```bash
+cd Lkmllm_code
 python -m unittest discover -s scripts -p 'test_*.py' -v
 ```
-
-MANIFEST.sha256 核对源码内容，不代表训练或测评已经完成。
