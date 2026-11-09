@@ -70,7 +70,9 @@ class LocalTests(unittest.TestCase):
         a=train.parser().parse_args(['--student-path','s','--teacher-path','t','--anno-json','a','--video-dir','v','--output-dir','o'])
         self.assertEqual(a.max_samples,2000)
         shell=(Path(train.__file__).parent/'run_head_opd_8gpu.sh').read_text()
-        self.assertIn('--max-samples 2000',shell)
+        self.assertIn('--max-samples 1000',shell)
+        self.assertIn('--pipeline --gpu-memory-gib 48',shell)
+        self.assertIn('--end-direction-ratio 2 3',shell)
         self.assertIn('--token-local-gate',shell)
         self.assertNotIn('--boundary-selective',shell)
 

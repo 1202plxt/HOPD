@@ -420,9 +420,9 @@ def scoring_logits(model, inputs, targets):
     return logits
 
 
-def training_inputs(processors, sample, a):
+def student_input_for_direction(processor, sample, a):
     import train_timelens_three_group_opsd as core
-    pool = decode_pool(processors[0], sample, a)
+    pool = decode_pool(processor, sample, a)
     groups = uniform_indices(len(pool['times']), pool['keep'])
     positions = [i for g in groups for i in range(g*pool['temporal'], (g+1)*pool['temporal'])]
     meta = copy.deepcopy(pool['metadata'])
@@ -431,18 +431,27 @@ def training_inputs(processors, sample, a):
     if getattr(a, 'token_local_gate', False):
         from qwen_token_local_gate import SECONDS_INSTRUCTION
         messages[-1]['content'][-1]['text'] += SECONDS_INSTRUCTION
-    text = processors[0].apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    student = dict(processors[0](text=[text], videos=[pool['frames'][positions]], video_metadata=[meta],
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    student = dict(processor(text=[text], videos=[pool['frames'][positions]], video_metadata=[meta],
         return_tensors='pt', padding=True, **dict(pool['options'],do_resize=False,do_sample_frames=False)))
-    core.verify_video_timestamps(processors[0], student, [meta])
-    actual = int((student['input_ids'] == processors[0].tokenizer.convert_tokens_to_ids('<|video_pad|>')).sum())
+    core.verify_video_timestamps(processor, student, [meta])
+    actual = int((student['input_ids'] == processor.tokenizer.convert_tokens_to_ids('<|video_pad|>')).sum())
     if not 0 < actual == pool['keep']*pool['per_group'] <= a.total_tokens:
         raise RuntimeError('Normal student visual budget mismatch')
-    teacher, audit = build_gt_clip_input(processors[1], sample, pool, 'gt_clip', a)
-    if audit['actual_visual_tokens'] != actual:
+    return student, dict(actual_visual_tokens=actual, source_frame_indices=meta['frames_indices'], user_prompt=messages[-1]['content'][-1]['text']), pool, pool['duration']
+
+
+def teacher_input_for_direction(processor, sample, a, pool, student_audit):
+    teacher, audit = build_gt_clip_input(processor, sample, pool, 'gt_clip', a)
+    if audit['actual_visual_tokens'] != student_audit['actual_visual_tokens']:
         raise RuntimeError('Student/teacher matched visual budget mismatch')
-    return student, teacher, dict(actual_visual_tokens=actual, source_frame_indices=meta['frames_indices'],
-        user_prompt=messages[-1]['content'][-1]['text']), audit, pool['duration']
+    return teacher, audit
+
+
+def training_inputs(processors, sample, a):
+    si, sa, pool, duration = student_input_for_direction(processors[0], sample, a)
+    ti, ta = teacher_input_for_direction(processors[1], sample, a, pool, sa)
+    return si, ti, sa, ta, duration
 
 
 def metrics(rows):

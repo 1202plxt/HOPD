@@ -30,18 +30,19 @@ VIDEOS="${VIDEOS:-$ASSET_ROOT/Lkmllm_data/datasets/Train/timelens-100k}"
 if [[ "${RESUME:-0}" == 1 && -z "${OUT:-}" ]]; then
   echo 'RESUME=1 requires OUT pointing to the original training directory.' >&2; exit 2
 fi
-OUT="${OUT:-$ASSET_ROOT/Lkmllm_data/checkpoints/qwen3_opd_rkl_gt2341_2kx2_autoGPU_$(date +%Y%m%d_%H%M%S)}"
-EVAL_OUT="${EVAL_OUT:-$ASSET_ROOT/Lkmllm_data/outputs/eval_results/$(basename "$OUT")_eval14336_dp2}"
+OUT="${OUT:-$ASSET_ROOT/Lkmllm_data/checkpoints/qwen3_opd_gt2341_end23_pipeline4_$(date +%Y%m%d_%H%M%S)}"
+EVAL_OUT="${EVAL_OUT:-$ASSET_ROOT/Lkmllm_data/outputs/eval_results/$(basename "$OUT")_eval14336_dp4}"
 PY="${PY:-python}"
 command -v "$PY" >/dev/null || { echo "Python not found: $PY" >&2; exit 2; }
 
-# Training automatically forms disjoint two-GPU groups.
+# Four roles: GPU0 screen, GPU1/2 frozen teacher, GPU3 online learner.
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HSA_VISIBLE_DEVICES
 export PYTHONUNBUFFERED=1
-BACKEND="$("$PY" -c 'import torch; assert torch.version.cuda and not torch.version.hip and torch.cuda.is_available() and torch.cuda.device_count()>=2, "Require at least two visible NVIDIA CUDA GPUs"; print("cuda")')"
-VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1}"
+BACKEND="$("$PY" -c 'import torch; assert torch.version.cuda and not torch.version.hip and torch.cuda.is_available() and torch.cuda.device_count()>=4, "Require at least four visible NVIDIA CUDA GPUs"; print("cuda")')"
+VISIBLE="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -r -a EVAL_IDS <<< "$VISIBLE"
-EVAL_DEVICES="${EVAL_DEVICES:-${EVAL_IDS[0]},${EVAL_IDS[1]}}"
+export CUDA_VISIBLE_DEVICES="${EVAL_IDS[0]},${EVAL_IDS[1]},${EVAL_IDS[2]},${EVAL_IDS[3]}"
+EVAL_DEVICES="${EVAL_DEVICES:-$CUDA_VISIBLE_DEVICES}"
 
 QV_ANNO="${QV_ANNO:-$ASSET_ROOT/Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json}"
 QV_VIDEOS="${QV_VIDEOS:-$ASSET_ROOT/Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights}"
@@ -68,20 +69,20 @@ esac
 echo "Python: $PY; backend: $BACKEND; CPU offload: ${CPU_OFFLOAD:-1}"
 echo "Asset root: ${ASSET_ROOT:-explicit paths}"
 echo "Training output: $OUT"
-echo 'RKL; 2000 accepted exposures per round x 2; <=5/5-15/15-60/>60=400/600/800/200'
+echo 'Four 48GiB GPUs; window 10; 1000 accepted; duration=200/300/400/100; end early/late=400/600'
 echo 'Only >60s bucket may repeat scarce events; independent event counts are logged.'
 if [[ -f "$OUT/summary.json" ]] && "$PY" -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s.get("training_complete") and s.get("merged") else 1)' "$OUT/summary.json"; then
   echo 'Training and merge already complete; continuing evaluation.'
 else
-"$PY" -u scripts/train_qwen3_32b_head_opd_dp4_mp2.py --auto-launch \
+"$PY" -u scripts/train_qwen3_32b_head_opd_dp4_mp2.py --pipeline --gpu-memory-gib 48 --prefetch-candidates 10 --end-direction-ratio 2 3 \
   --student-path "$STUDENT" \
   --teacher-path "$TEACHER" \
   --anno-json "$ANNO" \
   --video-dir "$VIDEOS" \
   --output-dir "$OUT" --gpus-per-worker 2 \
   --token-local-gate --boundary-epsilon 0 \
-  --distill-kl reverse --rounds 2 --duration-ratio 2 3 4 1 \
-  --lr 2e-5 --max-samples 2000 --max-attempts 0 --grad-accum 4 \
+  --distill-kl reverse --rounds 1 --duration-ratio 2 3 4 1 \
+  --lr 2e-5 --max-samples 1000 --max-attempts 0 --grad-accum 4 \
   --fps 2 --total-tokens 14336 --min-tokens 64 --max-frames 0 \
   --clip-total-tokens 4096 --clip-fps 4 --clip-max-frames 128 \
   --quiet --log-every 10 \

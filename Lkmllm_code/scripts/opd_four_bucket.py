@@ -85,3 +85,69 @@ class FourDurationRounds:
             repeated_accepted={k:exposures[k]-len(self.unique_accepted[k]) for k in self.names},
             repeat_policy='Only >60s bucket cycles shuffled candidates; all other buckets never reuse',
             stop_reason=self.stop_reason)
+
+from collections import Counter
+
+class CandidateWindow:
+
+    def __init__(self, samples, target, ratio, seed, max_attempts=0, limit=10):
+        if limit < 1:
+            raise ValueError('Candidate window must be positive')
+        self.source = FourDurationRounds(samples, target, ratio=ratio, seed=seed, max_attempts=max_attempts)
+        self.limit = limit
+        self.pending = {}
+        self.next_id = 0
+
+    def take(self, directions):
+        if len(self.pending) >= self.limit or not directions:
+            return None
+        s = self.source
+        reserved = Counter((t['bucket'] for t in self.pending.values()))
+        remaining = {k: s.quotas[k] - s.accepted[k] - reserved[k] for k in s.names}
+        eligible = {k: n for k, n in remaining.items() if n > 0 and (k == 'very_long' or s.cursors[k] < len(s.orders[k]))}
+        if not eligible or (s.max_attempts and s.attempts >= s.max_attempts):
+            return None
+        draw = s.rng.randrange(sum(eligible.values()))
+        for bucket, n in eligible.items():
+            draw -= n
+            if draw < 0:
+                break
+        s.current = bucket
+        rows = s.take_wave(1)
+        if not rows:
+            return None
+        index = s.wave[1][0]
+        s.finish_wave([False])
+        s.current = None
+        task = dict(id=self.next_id, index=index, bucket=bucket, sample=rows[0], directions=list(directions))
+        self.next_id += 1
+        self.pending[task['id']] = task
+        return task
+
+    def finish(self, task_id, accepted):
+        task = self.pending.pop(task_id)
+        if accepted:
+            s, k = (self.source, task['bucket'])
+            if s.accepted[k] >= s.quotas[k]:
+                raise RuntimeError('Duration quota exceeded')
+            s.accepted[k] += 1
+            s.unique_accepted[k].add(task['index'])
+
+    def state_dict(self):
+        return dict(source=self.source.state_dict(), limit=self.limit, pending=self.pending, next_id=self.next_id)
+
+    def load_state_dict(self, state):
+        if state['limit'] != self.limit:
+            raise ValueError('Keep candidate window unchanged on resume')
+        self.source.load_state_dict(state['source'])
+        self.pending = state['pending']
+        self.next_id = state['next_id']
+
+def physical_layout(visible):
+    ids = [v.strip() for v in visible.split(',')]
+    if len(ids) < 4 or not all(ids) or len(set(ids)) != len(ids):
+        raise ValueError('Expose exactly four distinct GPUs; order is screen, teacher, teacher, train')
+    return dict(screen=ids[0], teacher=','.join(ids[1:3]), train=ids[3])
+
+def direction_has_room(direction, quotas, counts):
+    return direction in quotas and counts[direction] < quotas[direction]

@@ -5,6 +5,12 @@ import contextlib
 import hashlib
 import json
 import math
+import inspect
+import multiprocessing as mp
+import queue
+import traceback
+import opd_resume as recovery
+from opd_four_bucket import CandidateWindow, physical_layout, direction_has_room
 import os
 from pathlib import Path
 import random
@@ -28,6 +34,13 @@ def parser():
     p.add_argument('--duration-ratio', nargs='+', type=int, default=None, help='3 buckets: <=5,5-15,>15; 4 buckets: <=5,5-15,15-60,>60')
     p.add_argument('--resume', action='store_true', help='Restore atomic resume.pt in the same output directory, including pending gradients')
     p.add_argument('--distill-kl', choices=('reverse',), default='reverse', help='Full-vocabulary RKL; Top10 is only the gate')
+    p.add_argument('--pipeline', action='store_true')
+    p.add_argument('--gpu-memory-gib', type=float, default=48.)
+    p.add_argument('--prefetch-candidates', type=int, default=10)
+    p.add_argument('--worker-timeout', type=float, default=3600.)
+    p.add_argument('--end-direction-ratio', nargs=2, type=int, default=None)
+    p.add_argument('--student-processor-path', default=None)
+    p.add_argument('--teacher-processor-path', default=None)
     p.add_argument('--quiet', action='store_true')
     p.add_argument('--log-every', type=int, default=10)
     p.add_argument('--token-local-gate', action='store_true', help='One teacher score; Top10 probability-weighted independent boundary-error gate; full-vocabulary KL on ordinary and accepted boundary positions')
@@ -254,7 +267,7 @@ def candidate_gradient(a, student, teacher, processors, sample):
     return record
 
 
-def main(argv=None):
+def synchronized_main(argv=None):
     values = sys.argv[1:] if argv is None else list(argv)
     a = parser().parse_args(values)
     if a.auto_launch and 'LOCAL_RANK' not in os.environ:
@@ -517,7 +530,476 @@ def adapter_digest(params):
     return h.hexdigest()
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
 
+def end_direction(student_result, sample):
+    if not student_result or not student_result.get('valid'):
+        return None
+    end = student_result['prediction'][1]
+    gt = sample['gt_end']
+    return 'early' if end < gt else 'late' if end > gt else 'equal'
+
+def allocate_directions(directions, quotas, accepted):
+    """Reserve no more than remaining accepted slots; rejections free slots next wave."""
+    reserved = dict(accepted)
+    allowed = []
+    for direction in directions:
+        ok = direction in quotas and reserved[direction] < quotas[direction]
+        allowed.append(ok)
+        if ok:
+            reserved[direction] += 1
+    return allowed
+
+def pipeline_parser():
+    p = parser()
+    p.description = 'Four K100s: screen 0, teacher 1/2, online student 3; bounded candidate window'
+    return p
+
+def pipeline_isolate(devices):
+    visibility = 'HIP_VISIBLE_DEVICES' if 'HIP_VISIBLE_DEVICES' in os.environ else 'CUDA_VISIBLE_DEVICES'
+    env = device_environment(os.environ, visibility, devices)
+    for key in ('CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'HSA_VISIBLE_DEVICES'):
+        os.environ.pop(key, None)
+    os.environ[visibility] = env[visibility]
+
+def pipeline_check_devices(count):
+    import torch
+    if not torch.cuda.is_available() or torch.cuda.device_count() != count:
+        raise RuntimeError(f'Pipeline expects CUDA/HIP torch and exactly {count} visible GPUs in this role')
+
+def pipeline_processor(path):
+    from transformers import AutoProcessor
+    p = AutoProcessor.from_pretrained(path, local_files_only=True, trust_remote_code=True, padding_side='left', do_resize=False)
+    if p.tokenizer.pad_token_id is None:
+        p.tokenizer.pad_token = p.tokenizer.eos_token
+    vp = p.video_processor
+    if tuple((int(getattr(vp, k)) for k in ('patch_size', 'merge_size', 'temporal_patch_size'))) != (16, 2, 2):
+        raise ValueError('Require native Qwen3 patch/merge/temporal=16/2/2')
+    return p
+
+def pipeline_configure_decoder(a):
+    import qwen_decode_worker as decoder
+    decoder.configure_decoder(timeout=a.decode_timeout, attempts=3)
+
+def pipeline_close_decoder():
+    import qwen_decode_worker as decoder
+    if decoder._decoder is not None:
+        decoder._decoder.close()
+        decoder._decoder = None
+
+def pipeline_memory_limit(a):
+    import torch
+    for i in range(torch.cuda.device_count()):
+        total = torch.cuda.get_device_properties(i).total_memory
+        limit = min(total, int(a.gpu_memory_gib * 1024**3))
+        torch.cuda.set_per_process_memory_fraction(limit / total, i)
+
+
+def pipeline_load_student(a):
+    import torch
+    from transformers import AutoModelForImageTextToText
+    from transformers import AutoConfig
+    torch.manual_seed(a.seed)
+    pipeline_memory_limit(a)
+    checkpoint_bytes = sum(item['bytes'] for item in video.checkpoint_identity(a.student_path)['files'])
+    available = min(torch.cuda.mem_get_info(0)[0], int(a.gpu_memory_gib * 1024**3))
+    if checkpoint_bytes + a.student_reserve_gib * 1024**3 > available:
+        raise RuntimeError('Student weights plus activation reserve do not fit the GPU memory budget')
+    p = pipeline_processor(a.student_processor_path or a.student_path)
+    saved = Path(a.student_path) / 'tokenizer.json'
+    if saved.is_file():
+        raw = json.loads(saved.read_text(encoding='utf-8'))
+        vocab = dict(raw['model']['vocab'])
+        vocab.update({x['content']: x['id'] for x in raw.get('added_tokens', [])})
+        if vocab != p.tokenizer.get_vocab():
+            raise ValueError('Student processor changed checkpoint token IDs')
+    model = AutoModelForImageTextToText.from_pretrained(a.student_path, local_files_only=True, trust_remote_code=True, config=AutoConfig.from_pretrained(a.student_path, local_files_only=True, trust_remote_code=True), torch_dtype=torch.bfloat16, device_map={'': 0}, attn_implementation='sdpa')
+    model.eval().requires_grad_(False)
+    if 'logits_to_keep' not in inspect.signature(model.forward).parameters:
+        raise RuntimeError('Installed model forward must support logits_to_keep')
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+        if hasattr(module, 'attention_dropout'):
+            module.attention_dropout = 0.0
+    return (model, p)
+
+def pipeline_parameters(student, protocol, a):
+    adapters = modeling.attach_head_lora(student, protocol['selected_heads'], a.rank, a.alpha, ['q_proj', 'o_proj'])
+    params = sorted(((n, p) for n, p in student.named_parameters() if p.requires_grad))
+    if sum((p.numel() for _, p in params)) != protocol['expected_trainable_parameters']:
+        raise RuntimeError('Unexpected trainable parameters')
+    return (adapters, params)
+
+def pipeline_cpu_parameters(params):
+    return {n: p.detach().cpu().clone() for n, p in params}
+
+def pipeline_copy_parameters(params, state):
+    import torch
+    if set(state) != {n for n, _ in params}:
+        raise ValueError('Adapter parameter names differ')
+    with torch.no_grad():
+        for n, p in params:
+            if p.shape != state[n].shape:
+                raise ValueError('Adapter parameter shape differs: ' + n)
+            p.copy_(state[n].to(device=p.device, dtype=p.dtype))
+
+def pipeline_screen_worker(a, protocol, inbox, outbox):
+    import torch
+    student, p = pipeline_load_student(a)
+    _, params = pipeline_parameters(student, protocol, a)
+    student.requires_grad_(False)
+    pipeline_configure_decoder(a)
+    weights = Path(a.output_dir) / 'screen_weights.pt'
+    stamp, version = (None, None)
+    outbox.put(dict(kind='ready', role='screen', runtime=video.runtime_identity()))
+    while True:
+        task = inbox.get()
+        if task is None:
+            return
+        current = weights.stat().st_mtime_ns
+        if current != stamp:
+            state = torch.load(weights, map_location='cpu', weights_only=False)
+            pipeline_copy_parameters(params, state['parameters'])
+            version, stamp = (state['step'], current)
+        started = time.monotonic()
+        si, audit, pool, duration = video.student_input_for_direction(p, task['sample'], a)
+        del pool
+        y, result = video.generate(student, p, si, task['sample'], duration, a, sampled=False)
+        direction = end_direction(result, task['sample'])
+        outbox.put(dict(kind='screen', id=task['id'], policy_step=version, direction=direction, eligible=direction in task['directions'], student=result, rollout_token_ids=y[0].tolist(), seconds=time.monotonic() - started, actual_visual_tokens=audit['actual_visual_tokens']))
+        del si, y
+
+def pipeline_load_teacher(a):
+    import torch
+    from transformers import AutoModelForImageTextToText
+    from accelerate import init_empty_weights, infer_auto_device_map
+    from accelerate.utils import get_balanced_memory
+    from transformers import AutoConfig
+    pipeline_memory_limit(a)
+    config = AutoConfig.from_pretrained(a.teacher_path, local_files_only=True, trust_remote_code=True)
+    with init_empty_weights():
+        empty = AutoModelForImageTextToText.from_config(config, trust_remote_code=True, torch_dtype=torch.bfloat16)
+    empty.tie_weights()
+    budget = {i: int(min(torch.cuda.mem_get_info(i)[0], int(a.gpu_memory_gib * 1024 ** 3)) - max(6., a.teacher_reserve_gib) * 1024 ** 3) for i in range(2)}
+    if min(budget.values()) <= 0:
+        raise RuntimeError('Insufficient free teacher GPU memory')
+    no_split = empty._no_split_modules or ['Qwen3VLDecoderLayer', 'Qwen3VLVisionBlock']
+    balanced = get_balanced_memory(empty, max_memory=budget, no_split_module_classes=no_split, dtype=torch.bfloat16)
+    device_map = infer_auto_device_map(empty, max_memory=balanced, no_split_module_classes=no_split, dtype=torch.bfloat16)
+    if any((str(d) in ('cpu', 'disk') for d in device_map.values())):
+        raise RuntimeError('32B teacher does not fit the two dedicated GPU budgets')
+    if {str(d).replace('cuda:', '') for d in device_map.values()} != {'0', '1'}:
+        raise RuntimeError('Expected teacher shards on both dedicated GPUs')
+    del empty
+    teacher = AutoModelForImageTextToText.from_pretrained(a.teacher_path, local_files_only=True, trust_remote_code=True, config=config, torch_dtype=torch.bfloat16, device_map=device_map, attn_implementation='sdpa')
+    teacher.eval().requires_grad_(False)
+    if 'logits_to_keep' not in inspect.signature(teacher.forward).parameters:
+        raise RuntimeError('Installed teacher must support logits_to_keep')
+    return teacher
+
+def pipeline_teacher_worker(a, inbox, outbox):
+    import torch
+    teacher = pipeline_load_teacher(a)
+    outbox.put(dict(kind='ready', role='teacher', runtime=video.runtime_identity(), device_map=teacher.hf_device_map, vocab_size=teacher.config.text_config.vocab_size))
+    while True:
+        request = inbox.get()
+        if request is None:
+            return
+        started = time.monotonic()
+        with torch.no_grad():
+            logits = video.scoring_logits(teacher, request['inputs'], request['tokens'])
+            log_q = logits.float().log_softmax(-1).cpu()
+            del logits
+        outbox.put(dict(kind='teacher', id=request['id'], log_q=log_q, seconds=time.monotonic() - started))
+
+def pipeline_worker_entry(role, devices, a, protocol, inbox, outbox, errors):
+    pipeline_isolate(devices)
+    if os.name == 'posix':
+        import signal
+
+        def stop(signum, frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop)
+    try:
+        pipeline_check_devices(2 if role == 'teacher' else 1)
+        if role == 'teacher':
+            pipeline_teacher_worker(a, inbox, outbox)
+        else:
+            pipeline_screen_worker(a, protocol, inbox, outbox)
+    except SystemExit:
+        pass
+    except BaseException:
+        errors.put(dict(role=role, traceback=traceback.format_exc()))
+        raise
+    finally:
+        pipeline_close_decoder()
+        outbox.cancel_join_thread()
+
+def pipeline_receive(outbox, workers, errors, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            error = errors.get_nowait()
+        except queue.Empty:
+            error = None
+        if error:
+            raise RuntimeError(error['role'] + ' worker failed:\n' + error['traceback'])
+        if any((p.exitcode is not None for p in workers)):
+            raise RuntimeError('Pipeline worker exited unexpectedly: ' + str([(p.name, p.exitcode) for p in workers]))
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Pipeline worker response timed out')
+        try:
+            return outbox.get(timeout=0.2)
+        except queue.Empty:
+            pass
+
+def pipeline_formal_gradient(a, student, teacher_processor, student_processor, task, quotas, counts, teacher_in, teacher_out, workers, errors):
+    import torch
+    from qwen_token_local_gate import completion_positions, validate_seconds_answer, topk_gate
+    si, sa, pool, duration = video.student_input_for_direction(student_processor, task['sample'], a)
+    y, sg = video.generate(student, student_processor, si, task['sample'], duration, a, sampled=False)
+    direction = end_direction(sg, task['sample'])
+    row = dict(sample=task['sample'], accepted=False, reason='formal_end_direction_filtered', student=sg, teacher=None, boundary=None, student_video=sa, teacher_video=None, end_direction=direction, selected_token_indices=[], rollout_token_ids=y[0].tolist())
+    if not direction_has_room(direction, quotas, counts):
+        return row
+    try:
+        ids = y[0].tolist()
+        validate_seconds_answer(student_processor.tokenizer, ids)
+        _, _, groups = completion_positions(student_processor.tokenizer, ids)
+    except ValueError as error:
+        row['reason'] = 'timestamp_tokens_' + str(error)
+        return row
+    ti, ta = video.teacher_input_for_direction(teacher_processor, task['sample'], a, pool, sa)
+    del pool
+    row['teacher_video'] = ta
+    row['boundary_token_groups'] = groups
+    teacher_in.put(dict(id=task['id'], inputs=ti, tokens=y))
+    student.train()
+    context = torch.autograd.graph.save_on_cpu(pin_memory=True) if a.offload_saved_tensors else contextlib.nullcontext()
+    with context:
+        logits = video.scoring_logits(student, si, y)
+        response = pipeline_receive(teacher_out, workers, errors, a.worker_timeout)
+        if response['kind'] != 'teacher' or response['id'] != task['id']:
+            raise RuntimeError('Teacher response/trajectory mismatch')
+        indices, kept, audit = topk_gate(student_processor.tokenizer, ids, groups, response['log_q'][0], logits[0], [task['sample']['gt_start'], task['sample']['gt_end']], a.boundary_epsilon)
+        row.update(accepted=bool(kept), reason='top10_expected_error_improved' if kept else 'no_top10_effective_position', token_local_gate=audit, selected_token_indices=indices, selected_boundary_indices=kept, ordinary_tokens=len(ids) - sum(map(len, groups)), teacher_seconds=response['seconds'])
+        if not kept:
+            return row
+        loss = reverse_kl(logits, response['log_q'], indices)
+    if not torch.isfinite(loss):
+        raise RuntimeError('Nonfinite reverse KL')
+    loss.backward()
+    row['loss'] = float(loss.detach())
+    return row
+
+def pipeline_main(argv=None):
+    a = pipeline_parser().parse_args(argv)
+    if any((k in os.environ for k in ('RANK', 'LOCAL_RANK', 'WORLD_SIZE'))):
+        raise ValueError('Launch this pipeline with plain python, not torchrun')
+    layout = physical_layout(os.environ.get('HIP_VISIBLE_DEVICES') or os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3'))
+    if not a.token_local_gate or a.boundary_selective or a.rounds != 1 or (not a.end_direction_ratio) or (len(a.duration_ratio or []) != 4):
+        raise ValueError('Pipeline requires token-local gate, end-direction ratio, four duration buckets and one round')
+    if not math.isfinite(a.gpu_memory_gib) or a.gpu_memory_gib <= 0:
+        raise ValueError('Require positive finite gpu-memory-gib')
+    if any(v <= 0 for v in a.end_direction_ratio):
+        raise ValueError('Require positive early/late ratio')
+    if a.prefetch_candidates < 1 or a.worker_timeout <= 0:
+        raise ValueError('Require positive prefetch-candidates and worker-timeout')
+    protocol, samples = prepare(a)
+    target = a.max_samples
+    early = target * a.end_direction_ratio[0] // sum(a.end_direction_ratio)
+    quotas = dict(early=early, late=target - early)
+    scheduler = CandidateWindow(samples, target, a.duration_ratio, a.seed, a.max_attempts, a.prefetch_candidates)
+    protocol.update(method='qwen3_end23_online_regeneration_pipeline_v1', accepted_target_global=target, end_direction_quotas=quotas, pipeline=dict(physical_gpus=layout, candidate_window=a.prefetch_candidates, screen_role='candidate metadata only; LoRA refreshed before each rollout when changed', train_role='regenerate with current weights; recheck direction; original token-local gate and full-vocab RKL', quota_accounting='final accepted formal rollouts; independent global duration and direction quotas', transport='bounded CPU queues; JSONL audit; tensor payloads in shared memory', resume='restore optimizer/RNG/pending gradients and candidate reservations; regenerate pending prescreens'), duration_sampling=scheduler.source.describe(), resume='Full pipeline state; incompatible with previous synchronized-worker checkpoints')
+    for name in ('train_qwen3_32b_head_opd_dp4_mp2.py', 'opd_four_bucket.py'):
+        protocol['source_sha256'][name] = video.sha(Path(__file__).parent / name)
+    if a.plan_only:
+        print(json.dumps(protocol, ensure_ascii=False, indent=2))
+        return 0
+    return pipeline_run(a, protocol, samples, quotas, scheduler, layout)
+
+def pipeline_run(a, protocol, samples, quotas, scheduler, layout):
+    pipeline_isolate(layout['train'])
+    import torch
+    pipeline_check_devices(1)
+    out = Path(a.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    lock = recovery.acquire_lock(out)
+    workers, channels = ([], [])
+    accepted = processed = steps = pending = formal_rollouts = 0
+    counts, reasons, selections, trained = (dict(early=0, late=0), Counter(), Counter(), [])
+    try:
+        saved = torch.load(out / 'resume.pt', map_location='cpu', weights_only=False) if a.resume else None
+        if saved and saved['contract'] != recovery.contract(protocol):
+            raise ValueError('Pipeline resume contract changed; keep code, data, models, topology and quotas unchanged')
+        if saved:
+            recovery.rollback_journals(out, saved['journal_offsets'])
+            import uuid
+            for folder in list(out.glob('step-*')) + [out / 'final-adapter', out / 'partial-adapter']:
+                if folder.is_dir() and (folder.name in ('final-adapter', 'partial-adapter') or int(folder.name[5:]) > saved['steps']):
+                    folder.rename(out / ('uncommitted_' + folder.name + '_' + uuid.uuid4().hex[:8]))
+        student, sp = pipeline_load_student(a)
+        tp = pipeline_processor(a.teacher_processor_path or a.teacher_path)
+        video.tokenizer_equivalence(sp.tokenizer, tp.tokenizer)
+        adapters, params = pipeline_parameters(student, protocol, a)
+        student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        student.config.use_cache = False
+        optimizer = torch.optim.AdamW([p for _, p in params], lr=a.lr, weight_decay=0.0)
+        optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(a.seed)
+        random.seed(a.seed)
+        initial = adapter_digest(params)
+        if saved:
+            pipeline_copy_parameters(params, saved['parameters'])
+            optimizer.load_state_dict(saved['optimizer'])
+            scheduler.load_state_dict(saved['scheduler'])
+            accepted, processed, steps, pending, formal_rollouts = (saved[k] for k in ('accepted', 'processed', 'steps', 'pending', 'formal_rollouts'))
+            counts.update(saved['direction_counts'])
+            reasons.update(saved['reasons'])
+            selections.update(saved['selections'])
+            trained, initial = (saved['trained'], saved['initial'])
+            for n, p in params:
+                g = saved['gradients'][n]
+                p.grad = None if g is None else g.to(device=p.device, dtype=p.dtype)
+            recovery.restore_rng(saved['rng'])
+            del saved
+        pipeline_configure_decoder(a)
+
+        def publish():
+            recovery.atomic_save(out / 'screen_weights.pt', dict(step=steps, parameters=pipeline_cpu_parameters(params)))
+        publish()
+        ctx = mp.get_context('spawn')
+        screen_in, screen_out = (ctx.Queue(a.prefetch_candidates), ctx.Queue(a.prefetch_candidates))
+        teacher_in, teacher_out, errors = (ctx.Queue(1), ctx.Queue(1), ctx.Queue())
+        channels = [screen_in, screen_out, teacher_in, teacher_out, errors]
+        for role, inbox, outbox in [('screen', screen_in, screen_out), ('teacher', teacher_in, teacher_out)]:
+            p = ctx.Process(target=pipeline_worker_entry, args=(role, layout[role], a, protocol, inbox, outbox, errors), name=role)
+            p.start()
+            workers.append(p)
+        runtime = [pipeline_receive(screen_out, workers, errors, a.worker_timeout), pipeline_receive(teacher_out, workers, errors, a.worker_timeout)]
+        if any((r.get('kind') != 'ready' for r in runtime)):
+            raise RuntimeError('Worker handshake failed')
+        if runtime[1]['vocab_size'] != student.config.text_config.vocab_size:
+            raise ValueError('Teacher/student output vocabulary dimensions differ')
+        metadata = dict(protocol, workers=runtime, learner_runtime=video.runtime_identity())
+        video.write(out / 'training_metadata.json', metadata)
+        video.write(out / 'candidate_samples.json', samples)
+        print(f"[pipeline] screen={layout['screen']} teacher={layout['teacher']} train={layout['train']} window={a.prefetch_candidates}; duration={scheduler.source.quotas}; end={quotas}", flush=True)
+        for task in scheduler.pending.values():
+            screen_in.put(task)
+
+        def refill():
+            directions = [d for d in quotas if direction_has_room(d, quotas, counts)]
+            while True:
+                task = scheduler.take(directions)
+                if task is None:
+                    break
+                screen_in.put(task)
+
+        def save_state():
+            offsets = recovery.journal_offsets(out)
+            offsets['screen.jsonl'] = (out / 'screen.jsonl').stat().st_size if (out / 'screen.jsonl').exists() else 0
+            recovery.atomic_save(out / 'resume.pt', dict(version=1, contract=recovery.contract(protocol), parameters=pipeline_cpu_parameters(params), optimizer=recovery.cpu_tree(optimizer.state_dict()), gradients={n: None if p.grad is None else p.grad.detach().cpu().clone() for n, p in params}, rng=recovery.rng_state(), scheduler=scheduler.state_dict(), initial=initial, accepted=accepted, processed=processed, steps=steps, pending=pending, formal_rollouts=formal_rollouts, direction_counts=counts, reasons=dict(reasons), selections=dict(selections), trained=trained, journal_offsets=offsets))
+        refill()
+        save_state()
+        started, initial_accepted = (time.monotonic(), accepted)
+        while accepted < a.max_samples and scheduler.pending:
+            screen = pipeline_receive(screen_out, workers, errors, a.worker_timeout)
+            task = scheduler.pending[screen['id']]
+            video.append(out / 'screen.jsonl', dict(screen, sample=task['sample'], duration_bucket=task['bucket']))
+            row = dict(sample=task['sample'], accepted=False, reason='prescreen_filtered', end_direction=screen['direction'], student=screen['student'])
+            sample_started = time.monotonic()
+            if screen['eligible'] and direction_has_room(screen['direction'], quotas, counts):
+                formal_rollouts += 1
+                row = pipeline_formal_gradient(a, student, tp, sp, task, quotas, counts, teacher_in, teacher_out, workers, errors)
+            row.update(candidate=processed + 1, task_id=task['id'], duration_bucket=task['bucket'], formal_policy_step=steps, screen_policy_step=screen['policy_step'], screen_end_direction=screen['direction'], seconds=time.monotonic() - sample_started)
+            reasons[row['reason']] += 1
+            if row['accepted']:
+                direction = row['end_direction']
+                if not direction_has_room(direction, quotas, counts):
+                    raise RuntimeError('Direction quota exceeded')
+                counts[direction] += 1
+                accepted += 1
+                pending += 1
+                trained.append(task['sample'])
+                for token in row['token_local_gate']:
+                    selections[token['field'] + ('_distill' if token['accepted'] else '_skip')] += 1
+                video.append(out / 'accepted_samples.jsonl', dict(row, accepted_index=accepted))
+            scheduler.finish(task['id'], row['accepted'])
+            processed += 1
+            video.append(out / 'train.jsonl', dict(row, accepted_total=accepted, optimizer_steps_before=steps))
+            if pending and (pending == a.grad_accum or accepted == a.max_samples):
+                with torch.no_grad():
+                    for _, p in params:
+                        if p.grad is not None:
+                            p.grad.div_(pending)
+                torch.nn.utils.clip_grad_norm_([p for _, p in params], a.max_grad_norm, error_if_nonfinite=True)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                steps += 1
+                pending = 0
+                publish()
+                if a.save_every_steps and steps % a.save_every_steps == 0:
+                    folder = out / f'step-{steps:06d}'
+                    modeling.save_adapter(folder, adapters, protocol)
+                    video.write(folder / 'summary.json', dict(optimizer_steps=steps, accepted_events=accepted))
+            refill()
+            elapsed, new = (time.monotonic() - started, accepted - initial_accepted)
+            eta = elapsed / new * (a.max_samples - accepted) if new else None
+            progress = dict(candidates=processed, formal_rollouts=formal_rollouts, accepted=accepted, target=a.max_samples, steps=steps, queued=len(scheduler.pending), end_direction_counts=counts, duration_counts=scheduler.source.accepted, elapsed_seconds=elapsed, estimated_remaining_seconds=eta)
+            video.append(out / 'progress.jsonl', progress)
+            if not a.quiet or processed % a.log_every == 0 or accepted == a.max_samples:
+                eta_text = f'{eta / 3600:.2f}h' if eta is not None else 'pending'
+                print(f'[pipeline] candidates={processed} formal={formal_rollouts} accepted={accepted}/{a.max_samples} steps={steps} queued={len(scheduler.pending)}/{a.prefetch_candidates} end={counts} duration={scheduler.source.accepted} elapsed={elapsed / 3600:.2f}h ETA~{eta_text}', flush=True)
+            save_state()
+        success = accepted == a.max_samples and counts == quotas and (scheduler.source.accepted == scheduler.source.quotas)
+        if success:
+            scheduler.source.advance_round()
+        summary = dict(training_complete=success, accepted_events=accepted, accepted_target=a.max_samples, candidate_events=processed, formal_rollouts=formal_rollouts, optimizer_steps=steps, end_direction_quotas=quotas, end_direction_counts=counts, duration_sampling=scheduler.source.describe(), gate_counts=dict(reasons), boundary_selection_counts=dict(selections), merged=False, initial_adapter_sha256=initial, final_adapter_sha256=adapter_digest(params))
+        success = success and summary['initial_adapter_sha256'] != summary['final_adapter_sha256']
+        summary['training_complete'] = success
+        modeling.save_adapter(out / ('final-adapter' if success else 'partial-adapter'), adapters, protocol)
+        video.write(out / 'summary.json', summary)
+        video.write(out / 'train_samples.json', trained)
+        if not success:
+            raise RuntimeError('Candidate pool/attempt limit exhausted before all quotas; partial adapter and resume saved')
+        if not a.skip_merge:
+            for name, adapter in adapters.items():
+                adapter.merge()
+                layer, target = name.split('.')
+                setattr(student.model.language_model.layers[int(layer)].self_attn, target, adapter.base)
+            student.gradient_checkpointing_disable()
+            student.config.use_cache = True
+            student.save_pretrained(out, safe_serialization=True, max_shard_size='4GB')
+            sp.save_pretrained(out)
+            summary['merged'] = True
+            video.write(out / 'summary.json', summary)
+        return 0
+    except BaseException as error:
+        video.write(out / 'failure_pipeline.json', dict(error=repr(error), traceback=traceback.format_exc(), accepted_events=accepted, candidate_events=processed, optimizer_steps=steps))
+        raise
+    finally:
+        for p in workers:
+            if p.is_alive():
+                p.terminate()
+        for p in workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=5)
+        for channel in channels:
+            channel.cancel_join_thread()
+            channel.close()
+        pipeline_close_decoder()
+        lock.close()
+
+def main(argv=None):
+    values = sys.argv[1:] if argv is None else list(argv)
+    if "--pipeline" in values:
+        return pipeline_main(values)
+    return synchronized_main(values)
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    raise SystemExit(main())
 
