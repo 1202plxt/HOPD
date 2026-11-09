@@ -2,7 +2,7 @@
 
 2026-11-07：将启动脚本使用的 token-local 模式从 Top1 升级为 **Top10 概率加权边界误差门控**，并移除假设替换的 `start < end` 约束。该版本与旧 Top1 训练属于不同协议，使用新输出目录；历史测评结果不归属于本次更新。
 
-2026-11-08：双卡 NVIDIA 启动脚本默认 **RKL、每轮2000条有效样本、连续两轮**，共4000条、有效batch=4、1000次更新；训练完成并导出完整权重后自动进行三套双卡分样本测评。每轮GT时长配额为2∶4∶4。此前实验分数不归入此协议。
+2026-11-09：默认RKL，GT时长四桶 **2∶3∶4∶1**；每轮2000次有效训练、连续两轮。自动按每两张GPU一组同步训练，支持完整状态恢复。旧实验成绩不归入新版本。
 
 ## 门控与蒸馏
 
@@ -60,61 +60,75 @@ LK_OPD/
 
 预算保持现有构造：14336/min64/fps2/maxframes0；教师 GT 参考片段最多4096视觉 token、fps4、128帧，包含在教师总视觉上限中，不是本次额外增加4096。默认使用预选 Qwen3 GT-mask Top10，不重新排名。
 
-## 双卡 NVIDIA：训练两轮后自动测评
 
-在已安装兼容 CUDA PyTorch 的环境中，从仓库根目录执行：
+## 自动检测卡数：两卡一组
+
+从仓库根目录执行，使用当前CUDA环境的python（可通过PY覆盖）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
 LK_OPD_ROOT=/fs0/AI/sx2624011/LKOPD/LK_OPD \
-bash Lkmllm_code/scripts/run_head_opd_2gpu.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 ```
 
-`PY` 默认使用当前环境的 `python`；可通过 `PY=/path/to/environment/bin/python` 覆盖。脚本从代码向父目录查找包含 `shared_models` 与 `Lkmllm_data` 的位置，或使用 `LK_OPD_ROOT`。模型与数据默认路径均在脚本中，可以直接修改。原 `run_head_opd_8gpu.sh` 文件名保留，两者现在启动同一套**恰好两卡 NVIDIA**流水线。该 shell 不再自动扩展到其他卡数或 HIP。
+历史脚本名保留；run_head_opd_2gpu.sh也是同一入口。不设置CUDA_VISIBLE_DEVICES时检测全部可见NVIDIA GPU。2/4/6/8卡分别形成1/2/3/4个工作组；奇数卡最后一张闲置。四卡处理两部分不同样本，经CPU Gloo同步梯度，得到同一份学生，不是两套独立权重。全局有效batch始终为4，不乘工作组数。
 
-默认学生从 `shared_models/Qwen3-VL-8B-Instruct` 起步，教师为冻结的 `Video-opd-teacher-Qwen3-VL-32B-GRPO`。通过 `STUDENT` 可明确覆盖起始完整权重；脚本不会自动载入之前的FKL检查点。双卡训练中学生在第一卡，教师在两卡间分片。
+学生是Qwen3-VL-8B-Instruct，独立冻结教师是Video-opd-teacher-Qwen3-VL-32B-GRPO。每组学生位于本组第一卡，32B教师跨组内两卡分片。支持卡数不代表显存一定足够；加载预检禁止CPU/disk教师回退。CPU激活卸载默认开启，CPU_OFFLOAD=0可关闭。
 
-### 两轮与样本分配
+资产目录从代码向父目录发现，或用LK_OPD_ROOT指定。STUDENT/TEACHER/ANNO/VIDEOS/OUT可覆盖sh中默认路径。仅支持单节点。
 
-- 每轮目标2000条**实际接受**样本：GT时长≤5秒400条，5秒<GT时长≤15秒800条，GT时长>15秒800条。
-- 这是GT事件长度分桶，不是视频总时长。>15秒桶仍同时包含15–60秒和>60秒事件。
-- 根据剩余有效配额随机选择分桶。拒绝不计数，继续同桶下一候选；候选预先分桶洗牌，取下一条无需再次扫描整个数据集。
-- 轮间保留同一个学生、Head-LoRA、AdamW和梯度累积状态；教师保持冻结。不重建优化器，不重新挂载LoRA，不重放前轮候选。
-- 两轮合计4000条新有效样本，短/中/长为800/1600/1600，默认1000次参数更新。配额不足或候选耗尽会报错并保留partial，不放宽配额，不进入测评。
+## GT时长四桶：2∶3∶4∶1
 
-参数已写在sh内：`--distill-kl reverse --rounds 2 --max-samples 2000 --duration-ratio 2 4 4 --max-attempts 0 --grad-accum 4`。Top10仍仅用于门控，普通位置与通过边界位置仍使用**全词表RKL**。
+按GT end-start分桶，不是视频长度或事件发生位置。
 
-训练元数据、逐候选门控审计、轮次、duration_bucket、最终每轮配额与接受样本列表均保留。`--quiet --log-every 10`减少控制台输出，完整JSONL审计不删除。
+| GT持续长度 | 每轮2000次有效训练 | 两轮合计 |
+|---|---:|---:|
+| ≤5秒 | 400 | 800 |
+| 5秒<长度≤15秒 | 600 | 1200 |
+| 15秒<长度≤60秒 | 800 | 1600 |
+| >60秒 | 200 | 400 |
 
-### 自动测评
+按剩余有效配额随机选桶；门控拒绝不计数，同桶取下一候选。候选预先分桶，无需每步扫描全标注。两轮保留同一个学生、Head-LoRA、AdamW；教师持续冻结，达到4000次目标时1000次参数更新。Top10门控和全词表RKL不变。
 
-训练完成并合并完整学生权重后，依次测评QVHighlights、Charades-STA、ActivityNet。每套均由两张卡独立加载同一学生权重，按样本分片，每条只测一次，最后合并指标。测评进程在训练进程退出、模型释放后启动。
+此前有效池中GT>60秒仅367条。**仅该桶允许耗尽后洗牌循环采样**，其他桶不重复。两轮400次有效训练及门控拒绝可能需要重用事件；不能写成4000条独立样本。启动前记录实际桶大小；summary.duration_sampling包含accepted_exposures、unique_accepted、repeated_accepted、每轮配额及尝试数。空桶或不可重复桶耗尽会报错，不静默改变配额。
 
-使用训练相同的纯秒数prompt，14336预算、min64、fps2、maxframes0、贪心生成、repetition_penalty=1；测评max_new_tokens=1024。GT只参与评分，不进入模型输入。失败样本计零，不从分母移除。结果放在：
+## 中断后继续：使用同一OUT
 
-```text
-Lkmllm_data/outputs/eval_results/<训练目录名>_eval14336_dp2/
-  Qvhighlights/
-  Charades_sta/
-  Activitynet/
-```
-
-三个测试集的annotation和视频路径可在sh中修改，或设置 `QV_ANNO/QV_VIDEOS`、`CHARADES_ANNO/CHARADES_VIDEOS`、`ACTIVITYNET_ANNO/ACTIVITYNET_VIDEOS`。脚本在训练前检查路径，防止训练完成后才发现缺少测试集。`OUT`指定新训练目录，`EVAL_OUT`指定新测评根目录。
-
-### 冒烟与验证
-
-较小目标测试（每轮10条，共20条；完成后仍会跑三套完整测评）：
+首次运行建议明确指定OUT：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 bash Lkmllm_code/scripts/run_head_opd_2gpu.sh \
-  --max-samples 10 --save-every-steps 1
+OUT=/path/to/Lkmllm_data/checkpoints/my_opd_2341 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 ```
 
-只测试训练可直接调用Python入口并使用同一组训练参数；多卡自动分组能力仍保留在Python入口中。快照仅保存权重，并非完整optimizer/RNG恢复。不要复用已有非空输出目录。
+中断后执行：
 
-本地CPU检查涵盖两轮配额、拒绝重试、不重复、有效batch与1000步计数，以及实际Bash流水线顺序、训练失败/未合并时阻止测评、缺少测试集时提前失败。未进行真实NVIDIA训练、显存或速度验证。
+```bash
+OUT=/path/to/Lkmllm_data/checkpoints/my_opd_2341 \
+RESUME=1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
+```
+
+同一OUT存在resume.pt时也自动恢复。RESUME=1必须指定OUT。恢复要求数据、代码、教师、学习率、配额、轮数、全局batch及工作组数不变，协议不匹配直接报错。排他锁拒绝同一OUT同时运行两套训练。
+
+每一批并行候选处理完成后，原子提交一份滚动resume.pt，保存适配器、AdamW、各工作组待累积梯度、四桶顺序/游标/轮次、接受记录、门控计数、Python/NumPy/PyTorch/各GPU随机状态，以及日志提交偏移。重启从最近一次完整提交继续，未提交的批次可能重算；日志回退到同一提交点，避免重复计数。未提交导出目录改名保留，避免重放时目录冲突。
+
+首份resume.pt在模型加载完成后生成，此前没有已完成训练进度。旧adapter.pt没有优化器/RNG/采样状态，无法当作完整恢复点。加载旧权重开启新阶段与无损恢复是不同实验。请固定运行环境和代码版本，不要在训练中git pull后要求旧状态通过校验。不承诺非确定GPU算子跨运行逐bit一致。
+
+## 自动接双卡分样本测评
+
+完成合并后依次测QVHighlights、Charades-STA、ActivityNet。无论训练用四卡或八卡，评测默认只用前两张可见卡（EVAL_DEVICES可指定），各卡加载同一完整学生并分配不同样本。训练进程退出后才启动测评。
+
+同一OUT已训练并合并完成时，sh跳过训练并继续测评。评测--resume保存已完成记录（失败也保留计零），不重复写入汇总。模型/标注/提示不匹配则拒绝续测；不会自动重试失败样本。
+
+使用纯秒数提示、14336/min64/fps2/maxframes0、贪心生成、repetition_penalty=1、输出最多1024token。GT只用于评分。三个测试集路径可在sh中修改，路径缺失在训练前报错。结果位于Lkmllm_data/outputs/eval_results/<训练名>_eval14336_dp2/，EVAL_OUT可覆盖。
+
+## 验证范围
 
 ```bash
 cd Lkmllm_code
 python -m unittest discover -s scripts -p 'test_*.py' -v
 ```
+
+CPU测试覆盖自动分组、全局batch、四桶比例、稀缺桶重复、状态序列恢复、原子提交中断、日志回退、四卡训练与双卡测评的环境隔离。PyTorch可用时另测真实AdamW与待累积梯度恢复的数值一致性。本地无PyTorch，相关数值检查跳过；尚未进行实际四卡训练、断电恢复或速度验证。

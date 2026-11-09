@@ -26,6 +26,7 @@ def parser():
     p.add_argument('--decode-timeout', type=float, default=600.)
     p.add_argument('--shard-index', type=int, default=0)
     p.add_argument('--shard-count', type=int, default=1)
+    p.add_argument('--resume', action='store_true')
     return p
 
 
@@ -38,7 +39,7 @@ def main():
     if min(a.total_tokens, a.min_tokens, a.max_new_tokens) < 1 or a.max_samples < 0:
         raise ValueError('Invalid counts')
     out = Path(a.output_dir)
-    if out.exists() and any(out.iterdir()):
+    if not a.resume and out.exists() and any(out.iterdir()):
         raise FileExistsError('Use a new empty evaluation directory')
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -53,6 +54,28 @@ def main():
     indexed = list(enumerate(samples))[a.shard_index::a.shard_count]
     if not indexed:
         raise ValueError('Empty shard; use fewer workers')
+    out.mkdir(parents=True, exist_ok=True)
+    current=dict(arguments={k:v for k,v in vars(a).items() if k not in ('resume','output_dir')},
+        prompt_suffix=prompt_suffix,model=video.checkpoint_identity(a.model_path),annotation_sha256=video.sha(a.anno_json),
+        source_sha256={p.name:video.sha(p) for p in [Path(__file__),Path(video.__file__)]})
+    manifest=out/'resume_contract.json'
+    journal=out/f'details_{a.split}.jsonl'
+    if manifest.exists() and video.read(manifest)!=current:
+        raise ValueError('Evaluation resume protocol/model/data changed')
+    if journal.exists() and not manifest.exists():
+        raise ValueError('Existing journal has no resume contract')
+    video.write(manifest,current)
+    previous={}
+    if journal.exists():
+        raw=journal.read_bytes();committed=raw[:raw.rfind(b'\n')+1]
+        if len(raw)!=len(committed):
+            with journal.open('r+b') as f:f.truncate(len(committed))
+        selected=dict(indexed)
+        for line in committed.decode('utf-8').splitlines():
+            row=json.loads(line);i=row['global_index']
+            if i in previous or i not in selected or row['sample']!=selected[i]:
+                raise ValueError('Evaluation journal identity mismatch')
+            previous[i]=row
     model = AutoModelForImageTextToText.from_pretrained(a.model_path, local_files_only=True,
         trust_remote_code=True, torch_dtype=torch.bfloat16, device_map={'':0}, attn_implementation='sdpa').eval()
     if model.config.model_type != 'qwen3_vl':
@@ -67,9 +90,10 @@ def main():
         failures='All selected rows remain in denominator; failures count zero', runtime=video.runtime_identity(),
         source_sha256={p.name:video.sha(p) for p in [Path(__file__), Path(video.__file__)]}))
     decoder.configure_decoder(timeout=a.decode_timeout, attempts=3)
-    rows, statuses = [], Counter()
+    rows=list(previous.values());statuses=Counter(r['status'] for r in rows)
     try:
         for i, (global_index, sample) in enumerate(indexed):
+            if global_index in previous:continue
             row = dict(index=i, global_index=global_index, sample=sample, valid=False, prediction=None, iou=0., status='error')
             inputs = None
             try:

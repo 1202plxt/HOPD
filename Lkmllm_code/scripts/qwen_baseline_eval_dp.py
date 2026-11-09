@@ -27,7 +27,7 @@ def main():
     if a.shard_index != 0 or a.shard_count != 1:
         raise ValueError('Do not set shard flags on the launcher')
     out = Path(a.output_dir)
-    if out.exists() and any(out.iterdir()):
+    if not a.resume and out.exists() and any(out.iterdir()):
         raise FileExistsError('Use a new empty output directory')
     import torch
     hip = bool(getattr(torch.version, 'hip', None))
@@ -44,7 +44,11 @@ def main():
     try:
         for rank, device in enumerate(ids):
             values = dict(vars(a),output_dir=str(out/f'worker{rank}'),shard_index=rank,shard_count=len(ids))
-            args = [item for key,value in values.items() for item in ('--'+key.replace('_','-'),str(value))]
+            args=[]
+            for key,value in values.items():
+                if isinstance(value,bool):
+                    if value:args.append('--'+key.replace('_','-'))
+                else:args.extend(['--'+key.replace('_','-'),str(value)])
             stream = (out/f'worker{rank}.log').open('w',encoding='utf-8')
             streams.append(stream)
             processes.append(subprocess.Popen([sys.executable,'-u',str(Path(evaluation.__file__)),*args],
@@ -70,8 +74,10 @@ def main():
         if set(rows) != set(range(len(selected))):
             raise ValueError('Incomplete global sample coverage')
         ordered = [rows[i] for i in range(len(selected))]
-        for row in ordered:
-            video.append(out/f'details_{a.split}.jsonl',row)
+        target=out/f'details_{a.split}.jsonl';tmp=target.with_suffix('.tmp')
+        with tmp.open('w',encoding='utf-8') as f:
+            for row in ordered:f.write(json.dumps(row,ensure_ascii=False)+'\n')
+        tmp.replace(target)
         summary = dict(video.metrics(ordered),complete=True,total=len(selected),evaluated=len(ordered),
             statuses=dict(Counter(r['status'] for r in ordered)))
         video.write(out/f'metrics_{a.split}.json',summary)

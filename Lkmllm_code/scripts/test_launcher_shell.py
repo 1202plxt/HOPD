@@ -13,7 +13,7 @@ BASH = os.environ.get('BASH_BIN') or shutil.which('bash')
 
 @unittest.skipUnless(BASH, 'Bash not available')
 class ShellLauncherTests(unittest.TestCase):
-    def run_launcher(self, fail_training=False, complete=True, missing_annotation=False):
+    def run_launcher(self, fail_training=False, complete=True, missing_annotation=False, mask='3,1', resume=False):
         with tempfile.TemporaryDirectory(prefix='opd pipeline ') as temporary:
             root = Path(temporary)
             scripts = root/'HOPD/Lkmllm_code/scripts'
@@ -39,7 +39,7 @@ with Path(os.environ['CAPTURE']).open('a') as f:
     f.write(json.dumps(dict(args=args,env=dict(os.environ)))+'\\n')
 if 'scripts/train_qwen3_32b_head_opd_dp4_mp2.py' in args:
     if os.environ['FAIL_TRAIN']=='1':sys.exit(23)
-    out=Path(args[args.index('--output-dir')+1]);out.mkdir(parents=True)
+    out=Path(args[args.index('--output-dir')+1]);out.mkdir(parents=True,exist_ok=True)
     (out/'summary.json').write_text(json.dumps(dict(training_complete=os.environ['COMPLETE']=='1',merged=True,accepted_events=4000,accepted_target=4000)))
 ''', encoding='utf-8')
             fake = root/'fake-python'
@@ -53,10 +53,16 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
             env = dict(os.environ, PY=fake.as_posix(), REAL_PY=Path(sys.executable).as_posix(),
                 CAPTURE_HELPER=capture.as_posix(), CAPTURE=str(captured),
                 FAIL_TRAIN=str(int(fail_training)), COMPLETE=str(int(complete)),
-                CUDA_VISIBLE_DEVICES='3,1', HIP_VISIBLE_DEVICES='7,2', ROCR_VISIBLE_DEVICES='0')
+                CUDA_VISIBLE_DEVICES=mask, HIP_VISIBLE_DEVICES='7,2', ROCR_VISIBLE_DEVICES='0')
             for name in ('LK_OPD_ROOT','STUDENT','TEACHER','ANNO','VIDEOS','OUT','EVAL_OUT','CPU_OFFLOAD',
                          'QV_ANNO','QV_VIDEOS','CHARADES_ANNO','CHARADES_VIDEOS','ACTIVITYNET_ANNO','ACTIVITYNET_VIDEOS'):
                 env.pop(name, None)
+            env.pop('RESUME',None)
+            if resume:
+                output=root/'Lkmllm_data/checkpoints/existing'
+                output.mkdir(parents=True)
+                (output/'resume.pt').write_bytes(b'fake rolling checkpoint')
+                env.update(OUT=output.as_posix(),RESUME='1')
             result = subprocess.run([BASH, (scripts/'run_head_opd_2gpu.sh').as_posix()],
                 cwd=root, env=env, text=True, capture_output=True, timeout=30)
             calls = [json.loads(s) for s in captured.read_text().splitlines()] if captured.exists() else []
@@ -71,7 +77,7 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
                             ('max-attempts','0'), ('grad-accum','4'), ('gpus-per-worker','2')]:
             self.assertEqual(train[train.index('--'+name)+1], value)
         i = train.index('--duration-ratio')
-        self.assertEqual(train[i+1:i+4], ['2','4','4'])
+        self.assertEqual(train[i+1:i+5], ['2','3','4','1'])
         self.assertIn('--offload-saved-tensors', train)
         for call, split in zip(calls[1:], ['Qvhighlights','Charades_sta','Activitynet']):
             args = call['args']
@@ -88,6 +94,15 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
         result, calls = self.run_launcher(fail_training=True)
         self.assertEqual(result.returncode, 23)
         self.assertEqual(len(calls), 1)
+
+    def test_four_gpu_training_resume_but_only_two_evaluation_gpus(self):
+        result,calls=self.run_launcher(mask='3,1,7,5',resume=True)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(calls[0]['env']['CUDA_VISIBLE_DEVICES'],'3,1,7,5')
+        self.assertIn('--resume',calls[0]['args'])
+        for call in calls[1:]:
+            self.assertEqual(call['env']['CUDA_VISIBLE_DEVICES'],'3,1')
+            self.assertIn('--resume',call['args'])
 
     def test_partial_training_never_starts_evaluation(self):
         result, calls = self.run_launcher(complete=False)

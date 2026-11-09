@@ -25,7 +25,8 @@ def parser():
         p.add_argument('--'+name, required=True)
     p.add_argument('--heads-json', default=str(ROOT/'heads/qwen3_gtmask_top10.json'))
     p.add_argument('--rounds', type=int, default=1, help='Each round accepts max-samples NEW events; preserve student and optimizer')
-    p.add_argument('--duration-ratio', nargs=3, type=int, default=None, metavar=('SHORT','MEDIUM','LONG'))
+    p.add_argument('--duration-ratio', nargs='+', type=int, default=None, help='3 buckets: <=5,5-15,>15; 4 buckets: <=5,5-15,15-60,>60')
+    p.add_argument('--resume', action='store_true', help='Restore atomic resume.pt in the same output directory, including pending gradients')
     p.add_argument('--distill-kl', choices=('reverse',), default='reverse', help='Full-vocabulary RKL; Top10 is only the gate')
     p.add_argument('--quiet', action='store_true')
     p.add_argument('--log-every', type=int, default=10)
@@ -121,7 +122,9 @@ def prepare(a):
     if 'train' not in {x.lower() for x in Path(a.anno_json).parts}:
         raise ValueError('Use annotations under a Train directory')
     out = Path(a.output_dir).resolve()
-    if out.exists() and any(out.iterdir()):
+    if a.resume and not (out/'resume.pt').is_file():
+        raise FileNotFoundError('Full-state resume requires output-dir/resume.pt; old adapter-only snapshots cannot restore AdamW/RNG')
+    if not a.resume and out.exists() and any(out.iterdir()):
         raise FileExistsError('Use a new empty output directory')
     student, teacher = video.checkpoint_identity(a.student_path), video.checkpoint_identity(a.teacher_path)
     if student['path'] == teacher['path']:
@@ -272,11 +275,15 @@ def main(argv=None):
     target = a.max_samples * a.rounds
     if a.duration_ratio:
         from opd_duration_sampler import DurationRounds
-        sampler = DurationRounds(samples, a.max_samples, rounds=a.rounds,
+        from opd_four_bucket import FourDurationRounds
+        sampler_class = FourDurationRounds if len(a.duration_ratio)==4 else DurationRounds
+        sampler = sampler_class(samples, a.max_samples, rounds=a.rounds,
             ratio=a.duration_ratio, seed=a.seed, max_attempts=a.max_attempts)
         protocol['duration_sampling'] = sampler.describe()
     protocol['accepted_target_global'] = target
-    protocol['round_policy'] = 'Continuous student, Head-LoRA and AdamW; frozen teacher; no candidate reuse across rounds'
+    protocol['round_policy'] = ('Continuous student/AdamW; frozen teacher; only >60s bucket may cycle scarce events'
+        if a.duration_ratio and len(a.duration_ratio)==4 else 'Continuous student/AdamW; frozen teacher; no candidate reuse')
+    protocol['resume_policy'] = 'Four-bucket runs atomically save resume.pt after each completed wave, including per-rank pending gradients and RNG'
     protocol['distributed'] = dict(workers=world, gpus_per_worker=a.gpus_per_worker,
         global_effective_batch=a.grad_accum, reduction='CPU float32 sum / global accepted count')
     if a.plan_only:
@@ -287,6 +294,9 @@ def main(argv=None):
     import torch
     import torch.distributed as dist
     import qwen_decode_worker as decoder
+    import opd_resume as recovery
+    if a.resume and (not sampler or len(a.duration_ratio)!=4):
+        raise ValueError('Full-state resume is supported for the four-bucket recipe')
     if torch.cuda.device_count() != a.gpus_per_worker:
         raise RuntimeError('Unexpected visible GPU count')
     if world > 1:
@@ -302,9 +312,24 @@ def main(argv=None):
             dist.barrier()
     out = Path(a.output_dir)
     accepted = processed = steps = pending = 0
+    saved = None
+    lock = None
     try:
         if any(p != protocol for p in gather(protocol)):
             raise RuntimeError('Worker protocol/candidate mismatch')
+        if rank == 0:
+            out.mkdir(parents=True,exist_ok=True)
+            lock=recovery.acquire_lock(out)
+        if a.resume:
+            saved = torch.load(out/'resume.pt',map_location='cpu',weights_only=False)
+            if saved['contract'] != recovery.contract(protocol) or saved['world'] != world:
+                raise ValueError('Resume contract changed: keep model, data, code, quotas, batch and worker count unchanged')
+            if rank == 0:
+                recovery.rollback_journals(out,saved['journal_offsets'])
+                import uuid
+                for folder in list(out.glob('step-*'))+[out/'final-adapter',out/'partial-adapter']:
+                    if folder.is_dir() and (folder.name in ('final-adapter','partial-adapter') or int(folder.name[5:])>saved['steps']):
+                        folder.rename(out/('uncommitted_'+folder.name+'_'+uuid.uuid4().hex[:8]))
         if rank == 0:
             out.mkdir(parents=True, exist_ok=True)
             video.write(out/'training_metadata.json', protocol)
@@ -342,6 +367,32 @@ def main(argv=None):
         if rank == 0:
             video.write(out/'training_metadata.json', protocol)
         reasons, selection_counts, trained = Counter(), Counter(), []
+        if saved is not None:
+            for name,p in params:
+                with torch.no_grad():p.copy_(saved['parameters'][name].to(p.device))
+            optimizer.load_state_dict(saved['optimizer'])
+            accepted,processed,steps,pending=(saved[k] for k in ('accepted','processed','steps','pending'))
+            initial=saved['initial'];sampler.load_state_dict(saved['sampler'])
+            reasons.update(saved['reasons']);selection_counts.update(saved['selection_counts'])
+            trained=saved['trained'] if rank==0 else []
+            state=saved['rank_states'][rank]
+            for name,p in params:
+                g=state['gradients'][name]
+                p.grad=None if g is None else g.to(device=p.device,dtype=p.dtype)
+            recovery.restore_rng(state['rng'])
+            if rank==0:print(f'[resume] accepted={accepted} steps={steps} pending={pending}; AdamW/sampler/RNG restored',flush=True)
+            del saved
+        def save_resume():
+            if not sampler or len(a.duration_ratio)!=4:return
+            states=gather(dict(rng=recovery.rng_state(),gradients={n:None if p.grad is None else p.grad.detach().cpu().clone() for n,p in params}))
+            if rank==0:
+                recovery.atomic_save(out/'resume.pt',dict(version=1,contract=recovery.contract(protocol),world=world,
+                    parameters={n:p.detach().cpu().clone() for n,p in params},optimizer=recovery.cpu_tree(optimizer.state_dict()),
+                    accepted=accepted,processed=processed,steps=steps,pending=pending,initial=initial,
+                    sampler=sampler.state_dict(),rank_states=states,reasons=dict(reasons),
+                    selection_counts=dict(selection_counts),trained=trained,journal_offsets=recovery.journal_offsets(out)))
+            barrier()
+        save_resume()
         progress_started = time.monotonic()
         while processed < len(samples) and accepted < target:
             if sampler and sampler.accepted == sampler.quotas:
@@ -404,8 +455,9 @@ def main(argv=None):
                 if not a.quiet or processed % a.log_every < count or accepted == target:
                     print(f'[OPD] candidates={processed} accepted={accepted}/{target} steps={steps} '
                           f'round={sampler.round_index if sampler else 1}/{a.rounds} elapsed={elapsed/3600:.2f}h ETA~{eta_text}', flush=True)
+            save_resume()
         if sampler and sampler.accepted == sampler.quotas and sampler.round_index == a.rounds:
-            sampler.advance_round()
+            if len(getattr(sampler,'completed',[]))<a.rounds:sampler.advance_round()
         hashes = gather(adapter_digest(params))
         if len(set(hashes)) != 1:
             raise RuntimeError('Student replicas diverged')
@@ -449,6 +501,7 @@ def main(argv=None):
                 accepted_events=accepted, candidate_events=processed, optimizer_steps=steps))
         raise
     finally:
+        if lock is not None:lock.close()
         if decoder._decoder is not None:
             decoder._decoder.close()
             decoder._decoder = None
