@@ -11,9 +11,9 @@ import unittest
 BASH = os.environ.get('BASH_BIN') or shutil.which('bash')
 
 
-@unittest.skipUnless(BASH, 'Bash not available')
+@unittest.skipUnless(BASH and os.name != 'nt', 'POSIX Bash runtime unavailable on Windows')
 class ShellLauncherTests(unittest.TestCase):
-    def run_launcher(self, fail_training=False, complete=True, missing_annotation=False, mask='3,1', resume=False):
+    def run_launcher(self, fail_training=False, complete=True, missing_annotation=False, mask='3,1,7,5', resume=False):
         with tempfile.TemporaryDirectory(prefix='opd pipeline ') as temporary:
             root = Path(temporary)
             scripts = root/'HOPD/Lkmllm_code/scripts'
@@ -68,12 +68,12 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
             calls = [json.loads(s) for s in captured.read_text().splitlines()] if captured.exists() else []
             return result, calls
 
-    def test_rkl_244_two_rounds_then_three_evaluations(self):
+    def test_four_card_1k_pipeline_then_three_evaluations(self):
         result, calls = self.run_launcher()
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertEqual(len(calls), 4)
         train = calls[0]['args']
-        for name, value in [('max-samples','2000'), ('rounds','2'), ('distill-kl','reverse'),
+        for name, value in [('max-samples','1000'), ('rounds','1'), ('distill-kl','reverse'),
                             ('max-attempts','0'), ('grad-accum','4'), ('gpus-per-worker','2')]:
             self.assertEqual(train[train.index('--'+name)+1], value)
         i = train.index('--duration-ratio')
@@ -87,7 +87,7 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
             self.assertIn('outputs/eval_results', args[args.index('--output-dir')+1])
             self.assertEqual(args[args.index('--prompt-mode')+1], 'decimal_seconds')
             self.assertEqual(args[args.index('--min-tokens')+1], '64')
-            self.assertEqual(call['env']['CUDA_VISIBLE_DEVICES'], '3,1')
+            self.assertEqual(call['env']['CUDA_VISIBLE_DEVICES'], '3,1,7,5')
             self.assertNotIn('HIP_VISIBLE_DEVICES', call['env'])
 
     def test_failed_training_never_starts_evaluation(self):
@@ -95,13 +95,13 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
         self.assertEqual(result.returncode, 23)
         self.assertEqual(len(calls), 1)
 
-    def test_four_gpu_training_resume_but_only_two_evaluation_gpus(self):
+    def test_four_gpu_training_resume_and_four_evaluation_gpus(self):
         result,calls=self.run_launcher(mask='3,1,7,5',resume=True)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertEqual(calls[0]['env']['CUDA_VISIBLE_DEVICES'],'3,1,7,5')
         self.assertIn('--resume',calls[0]['args'])
         for call in calls[1:]:
-            self.assertEqual(call['env']['CUDA_VISIBLE_DEVICES'],'3,1')
+            self.assertEqual(call['env']['CUDA_VISIBLE_DEVICES'],'3,1,7,5')
             self.assertIn('--resume',call['args'])
 
     def test_partial_training_never_starts_evaluation(self):
