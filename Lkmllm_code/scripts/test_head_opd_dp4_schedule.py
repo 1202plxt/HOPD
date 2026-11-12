@@ -9,10 +9,20 @@ import unittest
 from unittest.mock import patch
 
 import train_timelens_three_group_opsd as modeling
-from train_qwen3_32b_head_opd_dp4_mp2 import parser, prepare, group_devices, wave_size, main, automatic_topology, launch_auto
+from train_qwen3_32b_head_opd_dp4_mp2 import parser, prepare, group_devices, wave_size, main, automatic_topology, launch_auto, head_target_layout
 
 
 class TrainingTests(unittest.TestCase):
+    def test_qvo_count_deduplicates_shared_value_heads(self):
+        config=dict(hidden_size=8,num_attention_heads=4,num_key_value_heads=2,head_dim=2)
+        heads=[dict(layer=0,head=h) for h in (0,1,3)]
+        count,mapping=head_target_layout(config,heads,['q_proj','v_proj','o_proj'],rank=2)
+        self.assertEqual(mapping,{'0':[0,1]})
+        self.assertEqual(count,80)
+        self.assertEqual(head_target_layout(config,heads,['q_proj','o_proj'],2)[0],56)
+        with self.assertRaises(ValueError):
+            head_target_layout(config,heads,['q_proj','q_proj'],2)
+
     def test_student_and_teacher_gate_both_use_greedy_generation(self):
         import sys
         from types import SimpleNamespace
@@ -130,7 +140,7 @@ class TrainingTests(unittest.TestCase):
                 base = root/name
                 base.mkdir()
                 (base/'config.json').write_text(json.dumps(dict(model_type='qwen3_vl', text_config=dict(
-                    hidden_size=hidden, num_hidden_layers=layers, num_attention_heads=32))))
+                    hidden_size=hidden, num_hidden_layers=layers, num_attention_heads=32, num_key_value_heads=8))))
                 (base/'model.safetensors').write_bytes(b'identity-only-fixture')
             values = ['--student-path', str(root/'student'), '--teacher-path', str(root/'teacher'),
                       '--anno-json', str(train/'anno.json'), '--video-dir', str(train),
@@ -143,6 +153,11 @@ class TrainingTests(unittest.TestCase):
             self.assertFalse(protocol['rollout_generation']['student_do_sample'])
             self.assertFalse(protocol['rollout_generation']['teacher_do_sample'])
             self.assertFalse(protocol['boundary_policy']['overall_iou_gate'])
+            self.assertEqual(protocol['targets'],['q_proj','v_proj','o_proj'])
+            self.assertTrue(protocol['selected_v_kv_heads'])
+            self.assertEqual(protocol['expected_trainable_parameters'],
+                head_target_layout(protocol['student_checkpoint']['config']['text_config'],
+                                   protocol['selected_heads'],a.targets,a.rank)[0])
             self.assertFalse((root/'out').exists())
             output = io.StringIO()
             with patch.dict(os.environ, dict(RANK='0', LOCAL_RANK='0', WORLD_SIZE='1', CUDA_VISIBLE_DEVICES='0,1')), contextlib.redirect_stdout(output):
@@ -164,6 +179,34 @@ except ImportError:
 
 @unittest.skipIf(torch is None, 'PyTorch not installed; run on server')
 class TensorTests(unittest.TestCase):
+    def test_qvo_gqa_value_updates_shared_kv_head_and_merges(self):
+        from types import SimpleNamespace as N
+        from torch import nn
+        cfg=N(hidden_size=8,num_attention_heads=4,num_key_value_heads=2,head_dim=2)
+        attention=N(q_proj=nn.Linear(8,8,bias=False),v_proj=nn.Linear(8,4,bias=False),o_proj=nn.Linear(8,8,bias=False))
+        model=nn.Module()
+        model.config=N(text_config=cfg)
+        model.model=nn.Module(); model.model.language_model=nn.Module()
+        layer=nn.Module(); layer.self_attn=nn.Module()
+        for key in ('q_proj','v_proj','o_proj'): setattr(layer.self_attn,key,getattr(attention,key))
+        model.model.language_model.layers=nn.ModuleList([layer])
+        adapters=modeling.attach_head_lora(model,[dict(layer=0,head=0),dict(layer=0,head=1)],2,4,
+                                           ['q_proj','v_proj','o_proj'])
+        self.assertEqual(adapters['0.v_proj'].indices.tolist(),[0,1])
+        self.assertEqual(adapters['0.q_proj'].indices.tolist(),[0,1,2,3])
+        x=torch.randn(3,8)
+        for adapter in adapters.values():
+            with torch.no_grad(): adapter.B.fill_(.1)
+            base_before=adapter.base.weight.detach().clone()
+            before=adapter(x).detach()
+            adapter.merge()
+            self.assertTrue(torch.allclose(before,adapter.base(x),atol=1e-5))
+            changed=adapter.base.weight.detach()-base_before
+            if adapter.target in ('q_proj','v_proj'):
+                self.assertEqual(float(changed[len(adapter.indices):].abs().sum()),0.)
+            else:
+                self.assertEqual(float(changed[:,len(adapter.indices):].abs().sum()),0.)
+
     def test_only_selected_positions_receive_direct_gradient(self):
         from train_qwen3_boundary_selective_opd import reverse_kl
         student = torch.randn(1, 7, 11, requires_grad=True)

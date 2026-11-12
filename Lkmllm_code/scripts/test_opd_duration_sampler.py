@@ -8,6 +8,37 @@ def pool(n=30):
 
 
 class SamplerTests(unittest.TestCase):
+    def test_resume_244_preserves_rejected_bucket_rng_and_rounds(self):
+        original = DurationRounds(pool(30),10,rounds=2,seed=7)
+        for flag in (True,False,True,True,False):
+            original.take_wave(1)
+            original.finish_wave([flag])
+        state = original.state_dict()
+        restored = DurationRounds(pool(30),10,rounds=2,seed=7)
+        restored.load_state_dict(state)
+        while True:
+            if original.accepted == original.quotas:
+                self.assertEqual(restored.accepted,restored.quotas)
+                if not original.advance_round():
+                    self.assertFalse(restored.advance_round())
+                    break
+                self.assertTrue(restored.advance_round())
+            wave1, wave2 = original.take_wave(1), restored.take_wave(1)
+            self.assertEqual(wave1,wave2)
+            self.assertTrue(wave1)
+            flag = original.attempts % 4 != 0
+            original.finish_wave([flag]); restored.finish_wave([flag])
+        self.assertEqual(original.describe(),restored.describe())
+
+    def test_resume_244_rejects_open_wave_and_inconsistent_state(self):
+        sampler = DurationRounds(pool(),10)
+        sampler.take_wave(1)
+        with self.assertRaises(ValueError): sampler.state_dict()
+        sampler.finish_wave([False])
+        state = sampler.state_dict()
+        state['attempts'] += 1
+        with self.assertRaises(ValueError): sampler.load_state_dict(state)
+
     def test_two_rounds_quotas_no_reuse_continuous_batches(self):
         sampler = DurationRounds(pool(5000), 2000, rounds=2)
         seen = set()

@@ -77,7 +77,9 @@ exec "$REAL_PY" "$CAPTURE_HELPER" "$@"
                             ('max-attempts','0'), ('grad-accum','4'), ('gpus-per-worker','2')]:
             self.assertEqual(train[train.index('--'+name)+1], value)
         i = train.index('--duration-ratio')
-        self.assertEqual(train[i+1:i+5], ['2','3','4','1'])
+        self.assertEqual(train[i+1:i+4], ['2','4','4'])
+        i = train.index('--targets')
+        self.assertEqual(train[i+1:i+4], ['q_proj','v_proj','o_proj'])
         self.assertIn('--offload-saved-tensors', train)
         for call, split in zip(calls[1:], ['Qvhighlights','Charades_sta','Activitynet']):
             args = call['args']

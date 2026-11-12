@@ -137,6 +137,33 @@ class DurationRounds(AcceptedDurationSampler):
         self.stop_reason = None
         return True
 
+    def state_dict(self):
+        if getattr(self, '_wave', None) is not None:
+            raise ValueError('Cannot checkpoint an unfinished duration wave')
+        return dict(kind='duration_rounds_3_v1', rng_state=self.rng.getstate(),
+                    quotas=dict(self.quotas), rounds=self.rounds, round_index=self.round_index,
+                    accepted=dict(self.accepted), cursors=dict(self.cursors),
+                    current=self.current, attempts=self.attempts, stop_reason=self.stop_reason,
+                    completed=list(self.completed))
+
+    def load_state_dict(self, state):
+        if (state.get('kind') != 'duration_rounds_3_v1' or state.get('quotas') != self.quotas
+                or state.get('rounds') != self.rounds or not 1 <= state.get('round_index', 0) <= self.rounds
+                or set(state.get('accepted', {})) != set(self.names)
+                or set(state.get('cursors', {})) != set(self.names)):
+            raise ValueError('Saved 2:4:4 sampler contract differs')
+        for name in self.names:
+            if not (0 <= state['accepted'][name] <= self.quotas[name]
+                    and 0 <= state['cursors'][name] <= len(self.buckets[name])):
+                raise ValueError('Invalid sampler counts for '+name)
+        if (state.get('attempts') != sum(state['cursors'].values())
+                or state.get('current') not in (None, *self.names)):
+            raise ValueError('Invalid sampler cursor or current bucket')
+        self.rng.setstate(state['rng_state'])
+        for name in ('round_index','accepted','cursors','current','attempts','stop_reason','completed'):
+            setattr(self,name,state[name])
+        self._wave = None
+
     def describe(self):
         return dict(super().describe(), rounds=self.rounds, current_round=self.round_index,
                     completed_rounds=list(self.completed),

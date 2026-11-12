@@ -2,7 +2,7 @@
 
 2026-11-07：将启动脚本使用的 token-local 模式从 Top1 升级为 **Top10 概率加权边界误差门控**，并移除假设替换的 `start < end` 约束。该版本与旧 Top1 训练属于不同协议，使用新输出目录；历史测评结果不归属于本次更新。
 
-2026-11-09：默认RKL，GT时长四桶 **2∶3∶4∶1**；每轮2000次有效训练、连续两轮。自动按每两张GPU一组同步训练，支持完整状态恢复。旧实验成绩不归入新版本。
+2026-11-12：默认RKL，GT事件时长三桶 **2∶4∶4**，训练所选head的Q/V/O；每轮2000条有效训练、连续两轮。自动按每两张GPU一组同步训练，支持完整状态恢复。旧Q/O与四桶实验成绩不归入本版本。
 
 ## 门控与蒸馏
 
@@ -31,7 +31,7 @@ accept_position = (
 6. 至少一个边界位置通过，样本才执行反向传播、进入梯度累积并增加有效样本计数。没有通过位置时，普通 token 也不单独训练。
 7. 有效样本继续在普通位置和通过的边界位置计算完整词表的 `KL(student || stopgrad(teacher))`，先按所选 token 平均，再按全局有效 batch 平均样本梯度。**Top10 用于门控，实际 KL 仍为全词表，未改为 Top10 截断 KL。**
 
-教师完全冻结；仅训练预选 head 的 Q/O HeadLoRA，rank8、alpha16、lr2e-5。默认贪心生成、输出最多80 token。start/end 门控独立，整体 IoU 仅为日志指标。
+教师完全冻结；训练预选 head 的 Q/V/O HeadLoRA，rank8、alpha16、lr2e-5。Qwen3 的 GQA 会让多个 query head 共享同一个 KV head：V 的训练行按选中 query head 映射到对应共享 KV head，并在同层去重；对共享该 V head 的其他 query head 也可能产生影响。Q 和 O 仍限制在选中 query head 对应切片。默认贪心生成、输出最多80 token。start/end 门控独立，整体 IoU 仅为日志指标。
 
 ### 能证明与不能证明的内容
 
@@ -77,27 +77,26 @@ bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 
 资产目录从代码向父目录发现，或用LK_OPD_ROOT指定。STUDENT/TEACHER/ANNO/VIDEOS/OUT可覆盖sh中默认路径。仅支持单节点。
 
-## GT时长四桶：2∶3∶4∶1
+## GT时长三桶：2∶4∶4
 
 按GT end-start分桶，不是视频长度或事件发生位置。
 
-| GT持续长度 | 每轮2000次有效训练 | 两轮合计 |
+| GT持续长度 | 每轮2000条有效训练 | 两轮合计 |
 |---|---:|---:|
 | ≤5秒 | 400 | 800 |
-| 5秒<长度≤15秒 | 600 | 1200 |
-| 15秒<长度≤60秒 | 800 | 1600 |
-| >60秒 | 200 | 400 |
+| 5秒<长度≤15秒 | 800 | 1600 |
+| >15秒 | 800 | 1600 |
 
 按剩余有效配额随机选桶；门控拒绝不计数，同桶取下一候选。候选预先分桶，无需每步扫描全标注。两轮保留同一个学生、Head-LoRA、AdamW；教师持续冻结，达到4000次目标时1000次参数更新。Top10门控和全词表RKL不变。
 
-此前有效池中GT>60秒仅367条。**仅该桶允许耗尽后洗牌循环采样**，其他桶不重复。两轮400次有效训练及门控拒绝可能需要重用事件；不能写成4000条独立样本。启动前记录实际桶大小；summary.duration_sampling包含accepted_exposures、unique_accepted、repeated_accepted、每轮配额及尝试数。空桶或不可重复桶耗尽会报错，不静默改变配额。
+超过60秒的事件包含在>15秒桶内，不另设比例。本模式两个训练轮次都不重复使用候选事件；预检候选数不足或某桶在筛选中耗尽时，保留部分结果并报错，不放宽配额。summary.duration_sampling记录每轮配额、已接受数量和各桶尝试数。
 
 ## 中断后继续：使用同一OUT
 
 首次运行建议明确指定OUT：
 
 ```bash
-OUT=/path/to/Lkmllm_data/checkpoints/my_opd_2341 \
+OUT=/path/to/Lkmllm_data/checkpoints/my_opd_244_qvo \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 ```
@@ -105,14 +104,14 @@ bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 中断后执行：
 
 ```bash
-OUT=/path/to/Lkmllm_data/checkpoints/my_opd_2341 \
+OUT=/path/to/Lkmllm_data/checkpoints/my_opd_244_qvo \
 RESUME=1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash Lkmllm_code/scripts/run_head_opd_8gpu.sh
 ```
 
 同一OUT存在resume.pt时也自动恢复。RESUME=1必须指定OUT。恢复要求数据、代码、教师、学习率、配额、轮数、全局batch及工作组数不变，协议不匹配直接报错。排他锁拒绝同一OUT同时运行两套训练。
 
-每一批并行候选处理完成后，原子提交一份滚动resume.pt，保存适配器、AdamW、各工作组待累积梯度、四桶顺序/游标/轮次、接受记录、门控计数、Python/NumPy/PyTorch/各GPU随机状态，以及日志提交偏移。重启从最近一次完整提交继续，未提交的批次可能重算；日志回退到同一提交点，避免重复计数。未提交导出目录改名保留，避免重放时目录冲突。
+每一批并行候选处理完成后，原子提交一份滚动resume.pt，保存适配器、AdamW、各工作组待累积梯度、三桶游标/轮次/随机状态、接受记录、门控计数、Python/NumPy/PyTorch/各GPU随机状态，以及日志提交偏移。重启从最近一次完整提交继续，未提交的批次可能重算；日志回退到同一提交点，避免重复计数。未提交导出目录改名保留，避免重放时目录冲突。
 
 首份resume.pt在模型加载完成后生成，此前没有已完成训练进度。旧adapter.pt没有优化器/RNG/采样状态，无法当作完整恢复点。加载旧权重开启新阶段与无损恢复是不同实验。请固定运行环境和代码版本，不要在训练中git pull后要求旧状态通过校验。不承诺非确定GPU算子跨运行逐bit一致。
 
@@ -131,4 +130,4 @@ cd Lkmllm_code
 python -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-CPU测试覆盖自动分组、全局batch、四桶比例、稀缺桶重复、状态序列恢复、原子提交中断、日志回退、四卡训练与双卡测评的环境隔离。PyTorch可用时另测真实AdamW与待累积梯度恢复的数值一致性。本地无PyTorch，相关数值检查跳过；尚未进行实际四卡训练、断电恢复或速度验证。
+CPU测试覆盖自动分组、全局batch、2:4:4配额、状态序列恢复、GQA映射和参数计数、原子提交中断、日志回退以及训练与测评环境隔离。PyTorch可用时另测 Q/V/O 梯度和合并、AdamW与待累积梯度恢复。尚未进行实际多卡训练、断电恢复或速度验证。

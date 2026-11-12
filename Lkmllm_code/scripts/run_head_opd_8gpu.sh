@@ -30,7 +30,7 @@ VIDEOS="${VIDEOS:-$ASSET_ROOT/Lkmllm_data/datasets/Train/timelens-100k}"
 if [[ "${RESUME:-0}" == 1 && -z "${OUT:-}" ]]; then
   echo 'RESUME=1 requires OUT pointing to the original training directory.' >&2; exit 2
 fi
-OUT="${OUT:-$ASSET_ROOT/Lkmllm_data/checkpoints/qwen3_opd_rkl_gt2341_2kx2_autoGPU_$(date +%Y%m%d_%H%M%S)}"
+OUT="${OUT:-$ASSET_ROOT/Lkmllm_data/checkpoints/qwen3_opd_rkl_gt244_qvo_2kx2_autoGPU_$(date +%Y%m%d_%H%M%S)}"
 EVAL_OUT="${EVAL_OUT:-$ASSET_ROOT/Lkmllm_data/outputs/eval_results/$(basename "$OUT")_eval14336_dp2}"
 PY="${PY:-python}"
 command -v "$PY" >/dev/null || { echo "Python not found: $PY" >&2; exit 2; }
@@ -68,8 +68,8 @@ esac
 echo "Python: $PY; backend: $BACKEND; CPU offload: ${CPU_OFFLOAD:-1}"
 echo "Asset root: ${ASSET_ROOT:-explicit paths}"
 echo "Training output: $OUT"
-echo 'RKL; 2000 accepted exposures per round x 2; <=5/5-15/15-60/>60=400/600/800/200'
-echo 'Only >60s bucket may repeat scarce events; independent event counts are logged.'
+echo 'RKL; Q/V/O selected-head LoRA; 2000 accepted samples per round x 2; <=5/5-15/>15=400/800/800'
+echo 'Each candidate event is used at most once; >60s events are included in the >15s bucket.'
 if [[ -f "$OUT/summary.json" ]] && "$PY" -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s.get("training_complete") and s.get("merged") else 1)' "$OUT/summary.json"; then
   echo 'Training and merge already complete; continuing evaluation.'
 else
@@ -80,7 +80,7 @@ else
   --video-dir "$VIDEOS" \
   --output-dir "$OUT" --gpus-per-worker 2 \
   --token-local-gate --boundary-epsilon 0 \
-  --distill-kl reverse --rounds 2 --duration-ratio 2 3 4 1 \
+  --distill-kl reverse --targets q_proj v_proj o_proj --rounds 2 --duration-ratio 2 4 4 \
   --lr 2e-5 --max-samples 2000 --max-attempts 0 --grad-accum 4 \
   --fps 2 --total-tokens 14336 --min-tokens 64 --max-frames 0 \
   --clip-total-tokens 4096 --clip-fps 4 --clip-max-frames 128 \

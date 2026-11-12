@@ -24,6 +24,8 @@ def parser():
     for name in ('student-path', 'teacher-path', 'anno-json', 'video-dir', 'output-dir'):
         p.add_argument('--'+name, required=True)
     p.add_argument('--heads-json', default=str(ROOT/'heads/qwen3_gtmask_top10.json'))
+    p.add_argument('--targets', nargs='+', choices=('q_proj','v_proj','o_proj'),
+                   default=['q_proj','v_proj','o_proj'], help='Head-LoRA projection targets; defaults to Q/V/O')
     p.add_argument('--rounds', type=int, default=1, help='Each round accepts max-samples NEW events; preserve student and optimizer')
     p.add_argument('--duration-ratio', nargs='+', type=int, default=None, help='3 buckets: <=5,5-15,>15; 4 buckets: <=5,5-15,15-60,>60')
     p.add_argument('--resume', action='store_true', help='Restore atomic resume.pt in the same output directory, including pending gradients')
@@ -101,6 +103,29 @@ def wave_size(workers, batch, pending, target, accepted, remaining):
     return min(workers, batch-pending, target-accepted, remaining)
 
 
+def head_target_layout(config, heads, targets, rank):
+    """Count compact LoRA parameters, deduplicating V heads shared by GQA queries."""
+    num_q = int(config['num_attention_heads'])
+    num_kv = int(config.get('num_key_value_heads',num_q))
+    hidden = int(config['hidden_size'])
+    dim = int(config.get('head_dim',hidden//num_q))
+    if num_kv < 1 or num_q % num_kv or dim < 1:
+        raise ValueError('Invalid grouped-query attention head configuration')
+    if not targets or len(set(targets)) != len(targets) or any(t not in ('q_proj','v_proj','o_proj') for t in targets):
+        raise ValueError('Projection targets must be distinct Q/V/O projections')
+    grouped = {}
+    for head in heads:
+        grouped.setdefault(head['layer'],set()).add(head['head'])
+    groups = num_q//num_kv
+    mapping = {str(layer): sorted({head//groups for head in rows}) for layer,rows in grouped.items()}
+    total = 0
+    for layer,rows in grouped.items():
+        for target in targets:
+            count = len(mapping[str(layer)]) if target == 'v_proj' else len(rows)
+            total += rank*(hidden+count*dim)
+    return total,mapping
+
+
 def prepare(a):
     if a.rounds < 1 or a.log_every < 1 or (a.rounds > 1 and not a.duration_ratio):
         raise ValueError('Require positive rounds/log-every; multiple rounds require duration-ratio')
@@ -150,8 +175,7 @@ def prepare(a):
             raise ValueError('Duplicate or out-of-range head')
         coordinates.append(pair)
     heads = [dict(layer=l, head=h) for l, h in coordinates]
-    counts = Counter(h['layer'] for h in heads)
-    dim = sc.get('head_dim', sc['hidden_size']//sc['num_attention_heads'])
+    parameter_count, kv_mapping = head_target_layout(sc,heads,a.targets,a.rank)
     samples, stats = modeling.load_samples(a.anno_json, a.video_dir, 0, a.seed)
     if a.max_attempts and not a.duration_ratio:
         samples = samples[:a.max_attempts]
@@ -163,7 +187,9 @@ def prepare(a):
         selected_heads=heads, heads_sha256=video.sha(a.heads_json), data_stats=stats,
         candidate_count=len(samples), annotation_sha256=video.sha(a.anno_json),
         candidate_samples_sha256=hashlib.sha256(json.dumps(samples, sort_keys=True).encode()).hexdigest(),
-        expected_trainable_parameters=2*a.rank*sum(sc['hidden_size']+n*dim for n in counts.values()),
+        targets=list(a.targets), selected_v_kv_heads=kv_mapping if 'v_proj' in a.targets else {},
+        value_head_policy='GQA: selected query heads map to shared KV heads; deduplicated within each layer',
+        expected_trainable_parameters=parameter_count,
         boundary_policy=dict(epsilon_seconds=a.boundary_epsilon, overall_iou_gate=False,
             rule=(TOP10_POLICY['criterion'] if a.token_local_gate else 'student absolute error minus teacher absolute error > epsilon independently per boundary'),
             invalid='Skip invalid prediction, unsupported format or unreliable token mapping'),
@@ -181,7 +207,7 @@ def prepare(a):
             max_new_tokens=a.max_new_tokens, policy_version='greedy_v1_20261105'),
         visual_budget='Global source context and reference clip share the total cap; normal student has equal actual visual-token count',
         source_sha256={str(p.relative_to(ROOT)): video.sha(p) for p in sorted(ROOT.rglob('*.py'))},
-        resume='Weights-only snapshots; no optimizer/RNG resume'), samples
+        resume='step snapshots contain weights only; duration-sampled runs additionally save full-state resume.pt'), samples
 
 
 def candidate_gradient(a, student, teacher, processors, sample):
@@ -283,7 +309,7 @@ def main(argv=None):
     protocol['accepted_target_global'] = target
     protocol['round_policy'] = ('Continuous student/AdamW; frozen teacher; only >60s bucket may cycle scarce events'
         if a.duration_ratio and len(a.duration_ratio)==4 else 'Continuous student/AdamW; frozen teacher; no candidate reuse')
-    protocol['resume_policy'] = 'Four-bucket runs atomically save resume.pt after each completed wave, including per-rank pending gradients and RNG'
+    protocol['resume_policy'] = 'Duration-sampled runs atomically save resume.pt after each completed wave, including per-rank pending gradients and RNG'
     protocol['distributed'] = dict(workers=world, gpus_per_worker=a.gpus_per_worker,
         global_effective_batch=a.grad_accum, reduction='CPU float32 sum / global accepted count')
     if a.plan_only:
@@ -295,8 +321,8 @@ def main(argv=None):
     import torch.distributed as dist
     import qwen_decode_worker as decoder
     import opd_resume as recovery
-    if a.resume and (not sampler or len(a.duration_ratio)!=4):
-        raise ValueError('Full-state resume is supported for the four-bucket recipe')
+    if a.resume and not sampler:
+        raise ValueError('Full-state resume requires a duration sampler')
     if torch.cuda.device_count() != a.gpus_per_worker:
         raise RuntimeError('Unexpected visible GPU count')
     if world > 1:
@@ -339,7 +365,7 @@ def main(argv=None):
         video.tokenizer_equivalence(processors[0].tokenizer, processors[1].tokenizer)
         if student.config.text_config.vocab_size != teacher.config.text_config.vocab_size:
             raise ValueError('Output vocabulary dimensions differ')
-        adapters = modeling.attach_head_lora(student, protocol['selected_heads'], a.rank, a.alpha, ['q_proj', 'o_proj'])
+        adapters = modeling.attach_head_lora(student, protocol['selected_heads'], a.rank, a.alpha, a.targets)
         params = sorted((name, p) for name, p in student.named_parameters() if p.requires_grad)
         if ({id(p) for _, p in params} != {id(p) for m in adapters.values() for p in (m.A, m.B)}
                 or sum(p.numel() for _, p in params) != protocol['expected_trainable_parameters']):
@@ -383,7 +409,7 @@ def main(argv=None):
             if rank==0:print(f'[resume] accepted={accepted} steps={steps} pending={pending}; AdamW/sampler/RNG restored',flush=True)
             del saved
         def save_resume():
-            if not sampler or len(a.duration_ratio)!=4:return
+            if not sampler:return
             states=gather(dict(rng=recovery.rng_state(),gradients={n:None if p.grad is None else p.grad.detach().cpu().clone() for n,p in params}))
             if rank==0:
                 recovery.atomic_save(out/'resume.pt',dict(version=1,contract=recovery.contract(protocol),world=world,
